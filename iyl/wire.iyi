@@ -1,0 +1,657 @@
+module iyl/wire
+
+import std/socket::{IyiSocket, SocketError, IPAddress, IPv4Address, DnsError}
+import std/tls::{TlsClient, TlsConfig, TlsError}
+import std/time::{Time}
+import std/text
+import iyl/target::{Target}
+
+# The monotonic clock, in nanoseconds: every time in a run is read off it.
+pub def now_ns : Int64
+  Time.monotonic_nanoseconds.to_i64
+end
+
+# The vocabulary a transport failure is reported in. A report names these
+# and never a library's sentence, so a pipeline can match on them.
+pub def fault_categories : Array(String)
+  ["dns_failure", "connect_refused", "connect_timeout", "connect_failed",
+   "read_timeout", "write_timeout", "request_timeout", "connection_reset",
+   "connection_closed", "tls_error", "proxy_error", "protocol_error", "other"]
+end
+
+# A request that got no HTTP answer: its category, and the sentence that
+# said why. *stale* marks a kept connection the server had already closed,
+# found out before a byte of the answer came: the request is worth one more
+# try on a fresh connection, and is not the server's failure to answer.
+pub struct Fault
+  getter category : String
+  getter detail : String
+  getter stale : Bool
+
+  def initialize(@category : String, @detail : String, @stale : Bool = false)
+  end
+end
+
+impl Error for Fault
+  def message : String
+    "#{@category}: #{@detail}"
+  end
+end
+
+# How long each wait on the network may take (`timeout_ms`, 0 for none) and
+# when the whole request must be over (`deadline_ns` on the monotonic clock,
+# 0 for none).
+pub struct Limits
+  getter timeout_ms : Int32
+  getter deadline_ns : Int64
+
+  def initialize(@timeout_ms : Int32, @deadline_ns : Int64)
+  end
+
+  # The wait the next read or write may take, or a fault once the request's
+  # deadline has passed.
+  def wait_ms : Int32 | Fault
+    return @timeout_ms if @deadline_ns == 0
+    left_ns = @deadline_ns - now_ns
+    return Fault.new("request_timeout", "the request ran past its deadline") if left_ns <= 0
+    # Rounded up, so a wait that runs out has reached the deadline.
+    left = (left_ns + 999_999_i64) // 1_000_000_i64
+    return left.to_i32 if @timeout_ms == 0 || left < @timeout_ms.to_i64
+    @timeout_ms
+  end
+
+  # Whether a wait that ran out ran out because of the request's deadline:
+  # within the 2 ms a platform timer may fire early by.
+  def deadline_passed? : Bool
+    @deadline_ns != 0 && now_ns + 2_000_000_i64 >= @deadline_ns
+  end
+end
+
+def socket_fault(error : SocketError, writing : Bool, limits : Limits) : Fault
+  if error.timed_out?
+    return Fault.new("request_timeout", "the request ran past its deadline") if limits.deadline_passed?
+    return Fault.new(writing ? "write_timeout" : "read_timeout", error.message)
+  end
+  return Fault.new("connection_reset", error.message) if error.disconnected?
+  Fault.new("other", error.message)
+end
+
+def tls_fault(error : TlsError, limits : Limits) : Fault
+  if error.timed_out?
+    return Fault.new("request_timeout", "the request ran past its deadline") if limits.deadline_passed?
+    return Fault.new("read_timeout", error.message)
+  end
+  text = error.message
+  return Fault.new("connection_reset", text) if text.includes?("reset") || text.includes?("aborted")
+  Fault.new("tls_error", text)
+end
+
+# What a fresh connection cost before its first request could go: each in
+# nanoseconds, -1 for a step that did not happen (no lookup for an address,
+# no handshake in the clear).
+pub struct Setup
+  getter dns_ns : Int64
+  getter connect_ns : Int64
+  getter tls_ns : Int64
+
+  def initialize(@dns_ns : Int64, @connect_ns : Int64, @tls_ns : Int64)
+  end
+end
+
+# Addresses a worker has looked up, so that a run without keep-alive does not
+# ask a name server once per request: a lookup is timed when it happens.
+pub class DnsCache
+  @entries : Hash(String, Array(IPAddress))
+
+  def initialize
+    @entries = {} of String => Array(IPAddress)
+  end
+
+  def get(host : String) : Array(IPAddress) | Nil
+    @entries[host]?
+  end
+
+  def put(host : String, addresses : Array(IPAddress)) : Nil
+    @entries[host] = addresses
+  end
+end
+
+# What a connection reads into: one buffer for its life, so an answer of any
+# size costs no allocation, only the bytes it carries counted on the way past.
+BUFFER = 16384
+
+# One connection to a server, plain or under TLS, and the bytes it has read
+# and not yet looked at.
+pub class Conn
+  getter origin : String
+  # Requests answered on this connection.
+  getter served : Int32
+  @socket : IyiSocket
+  @tls : TlsClient | Nil
+  @buf : Pointer(UInt8)
+  @head : Int32
+  @tail : Int32
+  @open : Bool
+  @setup : Setup | Nil
+
+  def initialize(@socket : IyiSocket, @tls : TlsClient | Nil, @origin : String, setup : Setup)
+    @buf = Pointer(UInt8).malloc(BUFFER.to_u64)
+    @head = 0
+    @tail = 0
+    @served = 0
+    @open = true
+    @setup = setup
+  end
+
+  def open? : Bool
+    @open
+  end
+
+  def held : Int32
+    @tail - @head
+  end
+
+  def byte(at : Int32) : UInt8
+    @buf[@head + at]
+  end
+
+  def consume(n : Int32) : Nil
+    @head += n
+    if @head == @tail
+      @head = 0
+      @tail = 0
+    end
+  end
+
+  def answered : Nil
+    @served += 1
+  end
+
+  # What opening this connection cost, once: the first request on it is the
+  # one that paid for it.
+  def take_setup : Setup | Nil
+    setup = @setup
+    @setup = nil
+    setup
+  end
+
+  def close : Nil
+    return unless @open
+    @open = false
+    tls = @tls
+    if tls.is_a?(TlsClient)
+      tls.abort
+    else
+      @socket.close
+    end
+  end
+
+  # The text of *n* held bytes from *at*, for the few values kept as text.
+  def text(at : Int32, n : Int32) : String
+    from = @buf + (@head + at).to_i64
+    String.new(n) { |p| p.copy_from(from, n) }
+  end
+
+  def send(request : String, limits : Limits) : Nil | Fault | Cancelled
+    wait = limits.wait_ms
+    return wait if wait.is_a?(Fault)
+    tls = @tls
+    if tls.is_a?(TlsClient)
+      tls.write_timeout_ms = wait > 0 ? wait : nil
+      sent = tls.write(request)
+      return tls_fault(sent, limits) if sent.is_a?(TlsError)
+    else
+      @socket.write_timeout_ms = wait > 0 ? wait : nil
+      sent = @socket.write(request)
+      return sent if sent.is_a?(Cancelled)
+      return socket_fault(sent, true, limits) if sent.is_a?(SocketError)
+    end
+    nil
+  end
+
+  # More bytes after those held: how many came, 0 when the server closed.
+  def fill(limits : Limits) : Int32 | Fault | Cancelled
+    wait = limits.wait_ms
+    return wait if wait.is_a?(Fault)
+    if @head > 0
+      kept = @tail - @head
+      (@buf).copy_from(@buf + @head.to_i64, kept) if kept > 0
+      @head = 0
+      @tail = kept
+    end
+    room = BUFFER - @tail
+    return Fault.new("protocol_error", "an answer's head or chunk line is longer than #{BUFFER} bytes") if room <= 0
+    tls = @tls
+    if tls.is_a?(TlsClient)
+      tls.read_timeout_ms = wait > 0 ? wait : nil
+      piece = tls.read(room)
+      return Cancelled.new if piece.is_a?(TlsError) && piece.cancelled?
+      return tls_fault(piece, limits) if piece.is_a?(TlsError)
+      n = piece.bytesize
+      (@buf + @tail.to_i64).copy_from(piece.to_unsafe, n) if n > 0
+    else
+      @socket.read_timeout_ms = wait > 0 ? wait : nil
+      got = @socket.read(@buf + @tail.to_i64, room)
+      return got if got.is_a?(Cancelled)
+      return socket_fault(got, false, limits) if got.is_a?(SocketError)
+      n = got
+    end
+    @tail += n
+    n
+  end
+end
+
+# The answer to one request, its body read past and counted.
+pub struct Answer
+  getter status : Int32
+  getter body_bytes : Int64
+  # When the first byte of the answer arrived, on the monotonic clock.
+  getter first_byte_ns : Int64
+  getter keep_alive : Bool
+  getter location : String | Nil
+
+  def initialize(@status : Int32, @body_bytes : Int64, @first_byte_ns : Int64, @keep_alive : Bool, @location : String | Nil)
+  end
+end
+
+# ASCII lower case of a byte.
+def lower(b : UInt8) : UInt8
+  b >= 65_u8 && b <= 90_u8 ? b + 32_u8 : b
+end
+
+# Whether the held bytes at *at* spell *name*, in any case.
+def held_is?(conn : Conn, at : Int32, n : Int32, name : String) : Bool
+  return false unless n == name.bytesize
+  i = 0
+  while i < n
+    return false unless lower(conn.byte(at + i)) == name.to_unsafe[i]
+    i += 1
+  end
+  true
+end
+
+# Whether the held bytes from *at*, *n* long, hold *token* in any case.
+def held_has?(conn : Conn, at : Int32, n : Int32, token : String) : Bool
+  m = token.bytesize
+  return false if m > n
+  start = 0
+  while start + m <= n
+    i = 0
+    while i < m && lower(conn.byte(at + start + i)) == token.to_unsafe[i]
+      i += 1
+    end
+    return true if i == m
+    start += 1
+  end
+  false
+end
+
+# Where the held bytes from *from* next hold CR LF, or -1.
+def find_crlf(conn : Conn, from : Int32) : Int32
+  i = from
+  last = conn.held - 1
+  while i < last
+    return i if conn.byte(i) == 13_u8 && conn.byte(i + 1) == 10_u8
+    i += 1
+  end
+  -1
+end
+
+# The decimal number in held bytes, or -1 when they are not one.
+def held_number(conn : Conn, at : Int32, n : Int32) : Int64
+  value = 0_i64
+  digits = 0
+  i = 0
+  while i < n
+    b = conn.byte(at + i)
+    if b >= 48_u8 && b <= 57_u8
+      return -1_i64 if value > 100_000_000_000_000_i64
+      value = value * 10 + (b - 48_u8).to_i64
+      digits += 1
+    elsif !(b == 32_u8 || b == 9_u8)
+      return -1_i64
+    end
+    i += 1
+  end
+  digits > 0 ? value : -1_i64
+end
+
+# A chunk size line's hexadecimal number, or -1.
+def held_hex(conn : Conn, at : Int32, n : Int32) : Int64
+  value = 0_i64
+  digits = 0
+  i = 0
+  while i < n
+    b = lower(conn.byte(at + i))
+    break if b == 59_u8 || b == 32_u8 || b == 9_u8 # `;` starts an extension
+    d = if b >= 48_u8 && b <= 57_u8
+          (b - 48_u8).to_i64
+        elsif b >= 97_u8 && b <= 102_u8
+          (b - 87_u8).to_i64
+        else
+          -1_i64
+        end
+    return -1_i64 if d < 0 || value > 0x7_ffff_ffff_ffff_i64
+    value = value * 16 + d
+    digits += 1
+    i += 1
+  end
+  digits > 0 ? value : -1_i64
+end
+
+# A response head, read off the held bytes: the status, how the body is
+# framed, and the two headers a load test acts on.
+struct Head
+  getter status : Int32
+  getter http10 : Bool
+  getter length : Int64
+  getter chunked : Bool
+  getter close : Bool
+  getter keep_alive : Bool
+  getter location : String | Nil
+  getter size : Int32
+
+  def initialize(@status : Int32, @http10 : Bool, @length : Int64, @chunked : Bool, @close : Bool, @keep_alive : Bool, @location : String | Nil, @size : Int32)
+  end
+end
+
+# Reads until a whole head is held, and parses it. *first* is set to when the
+# first byte arrived; *fresh_bytes* says whether anything had come yet.
+def read_head(conn : Conn, limits : Limits, want_location : Bool, started_empty : Bool) : Head | Fault | Cancelled
+  scanned = 0
+  while true
+    if conn.held >= 4
+      i = scanned > 3 ? scanned - 3 : 0
+      last = conn.held - 4
+      found = -1
+      while i <= last
+        if conn.byte(i) == 13_u8 && conn.byte(i + 1) == 10_u8 && conn.byte(i + 2) == 13_u8 && conn.byte(i + 3) == 10_u8
+          found = i
+          break
+        end
+        i += 1
+      end
+      return parse_head(conn, found + 4, want_location) if found >= 0
+      scanned = conn.held
+    end
+    got = conn.fill(limits)
+    return got unless got.is_a?(Int32)
+    if got == 0
+      return Fault.new("connection_closed", "the server closed a kept connection before answering", true) if conn.held == 0 && started_empty && conn.served > 0
+      return Fault.new("connection_closed", "the server closed the connection before a whole answer came")
+    end
+  end
+end
+
+def parse_head(conn : Conn, size : Int32, want_location : Bool) : Head | Fault
+  line_end = find_crlf(conn, 0)
+  # `HTTP/1.1 200 OK`: the version, a space, three digits.
+  bad = Fault.new("protocol_error", "the answer does not start with an HTTP/1.x status line")
+  return bad if line_end < 12
+  return bad unless conn.byte(0) == 72_u8 && conn.byte(1) == 84_u8 && conn.byte(2) == 84_u8 && conn.byte(3) == 80_u8 && conn.byte(4) == 47_u8
+  http10 = conn.byte(5) == 49_u8 && conn.byte(7) == 48_u8
+  status = 0
+  k = 9
+  while k < 12
+    b = conn.byte(k)
+    return bad unless b >= 48_u8 && b <= 57_u8
+    status = status * 10 + (b - 48_u8).to_i32
+    k += 1
+  end
+  length = -1_i64
+  chunked = false
+  close = false
+  keep_alive = false
+  location = nil
+  at = line_end + 2
+  while at < size - 2
+    eol = find_crlf(conn, at)
+    break if eol < 0 || eol == at
+    colon = at
+    while colon < eol && conn.byte(colon) != 58_u8
+      colon += 1
+    end
+    if colon < eol
+      name_n = colon - at
+      v = colon + 1
+      while v < eol && (conn.byte(v) == 32_u8 || conn.byte(v) == 9_u8)
+        v += 1
+      end
+      value_n = eol - v
+      if held_is?(conn, at, name_n, "content-length")
+        length = held_number(conn, v, value_n)
+        return Fault.new("protocol_error", "the answer's Content-Length is not a number") if length < 0
+      elsif held_is?(conn, at, name_n, "transfer-encoding")
+        chunked = held_has?(conn, v, value_n, "chunked")
+      elsif held_is?(conn, at, name_n, "connection")
+        close = true if held_has?(conn, v, value_n, "close")
+        keep_alive = true if held_has?(conn, v, value_n, "keep-alive")
+      elsif want_location && held_is?(conn, at, name_n, "location")
+        location = conn.text(v, value_n).strip
+      end
+    end
+    at = eol + 2
+  end
+  Head.new(status, http10, length, chunked, close, keep_alive, location, size)
+end
+
+# Sends *request* on *conn* and reads the whole answer, counting its body:
+# the head parsed in place, the body read past through the connection's one
+# buffer, framed by its length, by chunks, or by the connection's close.
+pub def exchange(conn : Conn, request : String, head_request : Bool, want_location : Bool, limits : Limits) : Answer | Fault | Cancelled
+  started_empty = conn.held == 0
+  sent = conn.send(request, limits)
+  if sent.is_a?(Fault)
+    return Fault.new(sent.category, sent.detail, true) if conn.served > 0
+    return sent
+  end
+  return sent if sent.is_a?(Cancelled)
+  first_byte = 0_i64
+  while true
+    if conn.held == 0
+      got = conn.fill(limits)
+      return got if got.is_a?(Cancelled)
+      return Fault.new(got.category, got.detail, conn.served > 0 && got.category == "connection_reset") if got.is_a?(Fault)
+      if got == 0
+        return Fault.new("connection_closed", "the server closed a kept connection before answering", true) if conn.served > 0
+        return Fault.new("connection_closed", "the server closed the connection without answering")
+      end
+    end
+    first_byte = now_ns if first_byte == 0
+    head = read_head(conn, limits, want_location, started_empty)
+    return head unless head.is_a?(Head)
+    conn.consume(head.size)
+    # An interim answer (100 Continue, 103 Early Hints) is read past to the
+    # final one; a 101 has no HTTP after it, and is the answer.
+    break unless head.status >= 100 && head.status < 200 && head.status != 101
+  end
+  bodiless = head_request || head.status == 204 || head.status == 304 || (head.status >= 100 && head.status < 200)
+  # A 101 hands the connection to another protocol: it carries no more HTTP.
+  keep = head.status != 101 && (head.http10 ? head.keep_alive && !head.close : !head.close)
+  bytes = 0_i64
+  unless bodiless
+    if head.chunked
+      counted = read_chunked(conn, limits)
+      return counted unless counted.is_a?(Int64)
+      bytes = counted
+    elsif head.length >= 0
+      counted = read_length(conn, head.length, limits)
+      return counted unless counted.is_a?(Int64)
+      bytes = counted
+    else
+      counted = read_to_close(conn, limits)
+      return counted unless counted.is_a?(Int64)
+      bytes = counted
+      keep = false
+    end
+  end
+  conn.answered
+  Answer.new(head.status, bytes, first_byte, keep, head.location)
+end
+
+def read_length(conn : Conn, length : Int64, limits : Limits) : Int64 | Fault | Cancelled
+  left = length
+  while left > 0
+    if conn.held == 0
+      got = conn.fill(limits)
+      return got unless got.is_a?(Int32)
+      return Fault.new("connection_closed", "the server closed the connection #{left} bytes before the end of the body") if got == 0
+    end
+    take = conn.held.to_i64 < left ? conn.held : left.to_i32
+    conn.consume(take)
+    left -= take
+  end
+  length
+end
+
+def read_to_close(conn : Conn, limits : Limits) : Int64 | Fault | Cancelled
+  total = conn.held.to_i64
+  conn.consume(conn.held)
+  while true
+    got = conn.fill(limits)
+    return got unless got.is_a?(Int32)
+    break if got == 0
+    total += got
+    conn.consume(conn.held)
+  end
+  total
+end
+
+# A line ending in CR LF, held whole: where its CR is.
+def held_line(conn : Conn, limits : Limits) : Int32 | Fault | Cancelled
+  while true
+    eol = find_crlf(conn, 0)
+    return eol if eol >= 0
+    got = conn.fill(limits)
+    return got unless got.is_a?(Int32)
+    return Fault.new("connection_closed", "the server closed the connection inside a chunked body") if got == 0
+  end
+end
+
+def read_chunked(conn : Conn, limits : Limits) : Int64 | Fault | Cancelled
+  total = 0_i64
+  while true
+    eol = held_line(conn, limits)
+    return eol unless eol.is_a?(Int32)
+    size = held_hex(conn, 0, eol)
+    return Fault.new("protocol_error", "a chunk's size line is not a hexadecimal number") if size < 0
+    conn.consume(eol + 2)
+    if size == 0
+      # Trailers, if any, then the empty line that ends the body.
+      while true
+        eol = held_line(conn, limits)
+        return eol unless eol.is_a?(Int32)
+        conn.consume(eol + 2)
+        break if eol == 0
+      end
+      return total
+    end
+    counted = read_length(conn, size, limits)
+    return counted unless counted.is_a?(Int64)
+    total += size
+    eol = held_line(conn, limits)
+    return eol unless eol.is_a?(Int32)
+    return Fault.new("protocol_error", "a chunk is longer than its size line said") unless eol == 0
+    conn.consume(2)
+  end
+end
+
+# Whether *host* is an address or `localhost`: nothing to look up.
+def literal?(host : String) : Bool
+  return true if IyiSocket.localhost?(host) || host.includes?(":")
+  IyiSocket.read_ipv4(host).is_a?(IPv4Address)
+end
+
+def connect_fault(error : SocketError) : Fault
+  return Fault.new("dns_failure", error.message) if error.unresolved?
+  return Fault.new("connect_refused", error.message) if error.refused?
+  return Fault.new("connect_timeout", error.message) if error.timed_out?
+  Fault.new("connect_failed", error.message)
+end
+
+# A new connection for requests to *target*: through *proxy* when one is
+# given (a tunnel for `https://`), its name looked up through *cache*, its
+# TLS handshake made under *tls*. Each step is timed into the connection's
+# `Setup`, read by the first request that goes over it.
+pub def open(target : Target, proxy : Target | Nil, proxy_auth : String | Nil, tls : TlsConfig | Nil, cache : DnsCache, timeout_ms : Int32) : Conn | Fault | Cancelled
+  host = proxy.is_a?(Target) ? proxy.host : target.host
+  port = proxy.is_a?(Target) ? proxy.port : target.port
+  limits = Limits.new(timeout_ms, 0_i64)
+  dns_ns = -1_i64
+  socket = nil
+  t0 = now_ns
+  bound = timeout_ms > 0 ? timeout_ms : -1
+  if literal?(host)
+    made = IyiSocket.connect(host, port, bound)
+    return made if made.is_a?(Cancelled)
+    return connect_fault(made) if made.is_a?(SocketError)
+    socket = made
+  else
+    addresses = cache.get(host)
+    unless addresses.is_a?(Array(IPAddress))
+      found = IyiSocket.resolve(host)
+      return found if found.is_a?(Cancelled)
+      return Fault.new("dns_failure", "cannot resolve #{host}: #{found.message}") if found.is_a?(DnsError)
+      return Fault.new("dns_failure", "#{host} has no address") if found.empty?
+      dns_ns = now_ns - t0
+      cache.put(host, found)
+      addresses = found
+    end
+    t0 = now_ns
+    last = nil
+    IyiSocket.attempt_order(addresses).each do |address|
+      made = IyiSocket.connect(address.to_s, port, bound)
+      return made if made.is_a?(Cancelled)
+      if made.is_a?(SocketError)
+        last = made
+      else
+        socket = made
+        break
+      end
+    end
+    if socket.nil?
+      return last.is_a?(SocketError) ? connect_fault(last) : Fault.new("connect_failed", "no address of #{host} took the connection")
+    end
+  end
+  connected = socket.as(IyiSocket)
+  connect_ns = now_ns - t0
+  if proxy.is_a?(Target) && target.tls?
+    tunnel = open_tunnel(connected, target, proxy_auth, limits)
+    unless tunnel.nil?
+      connected.close
+      return tunnel
+    end
+  end
+  tls_ns = -1_i64
+  client = nil
+  if target.tls?
+    t1 = now_ns
+    config = tls.is_a?(TlsConfig) ? tls : TlsConfig.new
+    made = TlsClient.over(connected, target.host, config, timeout_ms > 0 ? timeout_ms : 10_000)
+    if made.is_a?(TlsError)
+      connected.close
+      return Fault.new("tls_error", made.message) unless made.timed_out?
+      return Fault.new("connect_timeout", "the TLS handshake with #{target.authority} timed out")
+    end
+    client = made
+    tls_ns = now_ns - t1
+  end
+  origin = proxy.is_a?(Target) && !target.tls? ? "proxy " + proxy.origin : target.origin
+  Conn.new(connected, client, origin, Setup.new(dns_ns, connect_ns, tls_ns))
+end
+
+# A `CONNECT` through the proxy on *socket* to *target*'s authority; nil once
+# the proxy answered 2xx and the tunnel is open.
+def open_tunnel(socket : IyiSocket, target : Target, proxy_auth : String | Nil, limits : Limits) : Fault | Cancelled | Nil
+  conn = Conn.new(socket, nil, "tunnel", Setup.new(-1_i64, -1_i64, -1_i64))
+  auth = proxy_auth.is_a?(String) ? "Proxy-Authorization: #{proxy_auth}\r\n" : ""
+  request = "CONNECT #{target.host.includes?(":") ? "[#{target.host}]" : target.host}:#{target.port} HTTP/1.1\r\nHost: #{target.host}:#{target.port}\r\n#{auth}\r\n"
+  sent = conn.send(request, limits)
+  return Fault.new("proxy_error", "the proxy took no CONNECT: #{sent.detail}") if sent.is_a?(Fault)
+  return sent if sent.is_a?(Cancelled)
+  head = read_head(conn, limits, false, true)
+  return head if head.is_a?(Cancelled)
+  return Fault.new("proxy_error", "the proxy did not answer CONNECT: #{head.detail}") if head.is_a?(Fault)
+  return Fault.new("proxy_error", "the proxy answered CONNECT with #{head.status}") unless head.status >= 200 && head.status < 300
+  nil
+end
