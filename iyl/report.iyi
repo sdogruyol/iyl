@@ -1,0 +1,604 @@
+module iyl/report
+
+import std/json::{JSON, Builder}
+import std/format::{sprintf}
+import std/text
+import iyl/plan::{Plan, version}
+import iyl/engine::{Outcome}
+import iyl/tally::{Tally, StatusTally, FaultTally, UrlTally}
+import iyl/histogram::{Histogram, Bin}
+import iyl/verdict::{Verdict, GateResult, Delta, requests_per_second, failure_percent}
+import iyl/duration::{format_duration}
+import iyl/wire::{fault_categories}
+
+# The version of the JSON report's shape. It moves only when a key changes
+# meaning or goes away; keys may be added under the same number.
+pub def schema_version : Int32
+  1
+end
+
+# ── numbers as people read them ────────────────────────────────────────────
+
+pub def grouped(n : Int64) : String
+  text = n.abs.to_s
+  out = String.build do |io|
+    i = 0
+    while i < text.bytesize
+      io << ',' if i > 0 && (text.bytesize - i) % 3 == 0
+      io << text[i]
+      i += 1
+    end
+  end
+  n < 0 ? "-" + out : out
+end
+
+# A rate with its thousands grouped and one decimal: `12,345.6`.
+pub def decimal(v : Float64) : String
+  tenths = (v * 10.0).round.to_i64
+  "#{grouped(tenths // 10)}.#{(tenths % 10).abs}"
+end
+
+pub def ms_text(ms : Float64) : String
+  return sprintf("%.3fs", ms / 1000.0) if ms >= 10_000.0
+  return sprintf("%.2fs", ms / 1000.0) if ms >= 1000.0
+  return sprintf("%.1fms", ms) if ms >= 100.0
+  return sprintf("%.2fms", ms) if ms >= 1.0
+  sprintf("%.0fus", ms * 1000.0)
+end
+
+pub def bytes_text(n : Float64) : String
+  return sprintf("%.0f B", n) if n < 1024.0
+  return sprintf("%.1f KiB", n / 1024.0) if n < 1024.0 * 1024.0
+  return sprintf("%.1f MiB", n / 1048576.0) if n < 1024.0 * 1024.0 * 1024.0
+  sprintf("%.2f GiB", n / 1073741824.0)
+end
+
+def round3(v : Float64) : Float64
+  (v * 1000.0).round / 1000.0
+end
+
+def percent(part : Int64, whole : Int64) : Float64
+  whole > 0 ? part.to_f * 100.0 / whole.to_f : 0.0
+end
+
+def mode(plan : Plan) : String
+  return "duration" if plan.requests == 0
+  return "requests" if plan.duration_ns == 0
+  "both"
+end
+
+def correcting?(plan : Plan) : Bool
+  plan.latency_correction && plan.rate > 0.0
+end
+
+# ── JSON ───────────────────────────────────────────────────────────────────
+
+def latency_object(json : Builder, h : Histogram) : Nil
+  json.object do
+    json.field("count", h.count)
+    json.field("avg", round3(h.avg))
+    json.field("min", round3(h.minimum))
+    json.field("max", round3(h.maximum))
+    json.field("stdev", round3(h.stdev))
+    [{"p50", 50.0}, {"p75", 75.0}, {"p90", 90.0}, {"p95", 95.0}, {"p99", 99.0}, {"p999", 99.9}].each do |p|
+      json.field(p[0], round3(h.percentile(p[1])))
+    end
+  end
+end
+
+def phase_object(json : Builder, h : Histogram) : Nil
+  json.object do
+    json.field("count", h.count)
+    json.field("avg", round3(h.avg))
+    json.field("min", round3(h.minimum))
+    json.field("max", round3(h.maximum))
+    json.field("p50", round3(h.percentile(50.0)))
+    json.field("p95", round3(h.percentile(95.0)))
+    json.field("p99", round3(h.percentile(99.0)))
+  end
+end
+
+def gate_object(json : Builder, g : GateResult) : Nil
+  json.object do
+    json.field("name", g.name)
+    json.field("scope", g.scope)
+    json.field("metric", g.metric)
+    json.field("comparator", g.comparator)
+    json.field("limit", round3(g.limit))
+    json.field("actual", round3(g.actual))
+    json.field("passed", g.passed)
+  end
+end
+
+def seconds_or_nil(json : Builder, name : String, ns : Int64) : Nil
+  if ns > 0
+    json.field(name, round3(ns.to_f / 1_000_000_000.0))
+  else
+    json.field(name, nil)
+  end
+end
+
+# The whole report as one JSON document. Every key is always there; one
+# that does not apply to the run is null.
+pub def to_json(plan : Plan, outcome : Outcome, verdict : Verdict) : String
+  t = outcome.tally
+  rps = requests_per_second(outcome)
+  elapsed = outcome.elapsed_s
+  JSON.build(2) do |json|
+    json.object do
+      json.field("schema_version", schema_version)
+      json.field("tool") do
+        json.object do
+          json.field("name", "iyl")
+          json.field("version", version)
+        end
+      end
+      json.field("title", plan.title)
+      json.field("mode", mode(plan))
+      json.field("config") do
+        json.object do
+          json.field("workers", outcome.workers)
+          json.field("connections", plan.connections)
+          plan.requests > 0 ? json.field("requests", plan.requests) : json.field("requests", nil)
+          seconds_or_nil(json, "duration_seconds", plan.duration_ns)
+          seconds_or_nil(json, "warmup_seconds", plan.warmup_ns)
+          plan.rate > 0.0 ? json.field("rate", plan.rate) : json.field("rate", nil)
+          json.field("method", plan.method)
+          json.field("keepalive", plan.keepalive)
+          json.field("follow_redirects", plan.follow_redirects)
+          json.field("latency_correction", correcting?(plan))
+          seconds_or_nil(json, "timeout_seconds", plan.timeout_ms.to_i64 * 1_000_000_i64)
+          seconds_or_nil(json, "request_timeout_seconds", plan.request_timeout_ns)
+          json.field("success_statuses", plan.success_text)
+        end
+      end
+      json.field("summary") do
+        json.object do
+          json.field("requests", t.requests)
+          json.field("responses", t.responses)
+          json.field("ok", t.ok)
+          json.field("failed", t.failed)
+          json.field("transport_errors", t.faults)
+          json.field("abandoned", t.abandoned)
+          json.field("redirects", t.redirects)
+          json.field("elapsed_seconds", round3(elapsed))
+          json.field("requests_per_second", round3(rps))
+          json.field("failure_rate_percent", round3(failure_percent(t)))
+        end
+      end
+      json.field("rate") do
+        json.object do
+          if plan.rate > 0.0
+            json.field("requested_per_second", plan.rate)
+            json.field("attained_per_second", round3(rps))
+            json.field("attainment_percent", round3(rps * 100.0 / plan.rate))
+            json.field("scheduled_requests", outcome.scheduled)
+            json.field("issued_requests", outcome.issued)
+            json.field("skipped_requests", outcome.skipped)
+            json.field("max_send_delay_ms", round3(t.send_delay.maximum))
+          else
+            json.field("requested_per_second", nil)
+            json.field("attained_per_second", round3(rps))
+            json.field("attainment_percent", nil)
+            json.field("scheduled_requests", nil)
+            json.field("issued_requests", nil)
+            json.field("skipped_requests", nil)
+            json.field("max_send_delay_ms", nil)
+          end
+        end
+      end
+      json.field("transfer") do
+        json.object do
+          json.field("total_bytes", t.bytes)
+          json.field("bytes_per_response", round3(t.responses > 0 ? t.bytes.to_f / t.responses.to_f : 0.0))
+          json.field("bytes_per_second", round3(elapsed > 0.0 ? t.bytes.to_f / elapsed : 0.0))
+        end
+      end
+      json.field("latency_ms") { latency_object(json, t.latency) }
+      json.field("corrected_latency_ms") { latency_object(json, t.corrected) }
+      json.field("send_delay_ms") { latency_object(json, t.send_delay) }
+      json.field("phases_ms") do
+        json.object do
+          json.field("dns") { phase_object(json, t.dns) }
+          json.field("connect") { phase_object(json, t.connect) }
+          json.field("tls") { phase_object(json, t.tls) }
+          json.field("ttfb") { phase_object(json, t.ttfb) }
+          json.field("total") { phase_object(json, t.latency) }
+        end
+      end
+      json.field("histogram") do
+        json.array do
+          (correcting?(plan) ? t.corrected : t.latency).bins(10).each do |bin|
+            json.object do
+              json.field("start_ms", round3(bin.start_ms))
+              json.field("end_ms", round3(bin.end_ms))
+              json.field("count", bin.count)
+              json.field("percent", round3(bin.percent))
+            end
+          end
+        end
+      end
+      json.field("statuses") do
+        json.array do
+          t.statuses.keys.sorted.each do |code|
+            s = t.statuses[code]
+            json.object do
+              json.field("code", code)
+              json.field("count", s.count)
+              json.field("percent", round3(percent(s.count, t.responses)))
+              json.field("success", plan.success?(code))
+              json.field("avg_ms", round3(s.latency.avg))
+              json.field("p50_ms", round3(s.latency.percentile(50.0)))
+              json.field("p95_ms", round3(s.latency.percentile(95.0)))
+              json.field("p99_ms", round3(s.latency.percentile(99.0)))
+            end
+          end
+        end
+      end
+      json.field("transport_errors") do
+        json.array do
+          fault_categories.each do |kind|
+            f = t.fault_kinds[kind]?
+            next unless f.is_a?(FaultTally)
+            json.object do
+              json.field("category", kind)
+              json.field("count", f.count)
+              json.field("percent", round3(percent(f.count, t.requests)))
+              json.field("sample", f.sample)
+            end
+          end
+        end
+      end
+      if t.urls.empty?
+        json.field("urls", nil)
+      else
+        json.field("urls") do
+          json.array do
+            plan.targets.each do |p|
+              u = t.urls[p.index]
+              h = correcting?(plan) ? u.corrected : u.latency
+              json.object do
+                json.field("url", p.target.url)
+                json.field("method", p.method)
+                json.field("requests", u.requests)
+                json.field("responses", u.responses)
+                json.field("transport_errors", u.faults)
+                json.field("ok", u.ok)
+                json.field("failed", u.failed)
+                json.field("failure_rate_percent", round3(percent(u.failed + u.faults, u.requests)))
+                json.field("requests_per_second", round3(elapsed > 0.0 ? u.requests.to_f / elapsed : 0.0))
+                json.field("avg_ms", round3(h.avg))
+                json.field("min_ms", round3(h.minimum))
+                json.field("max_ms", round3(h.maximum))
+                json.field("p50_ms", round3(h.percentile(50.0)))
+                json.field("p95_ms", round3(h.percentile(95.0)))
+                json.field("p99_ms", round3(h.percentile(99.0)))
+              end
+            end
+          end
+        end
+      end
+      path = plan.baseline_path
+      if path.is_a?(String)
+        json.field("baseline") do
+          json.object do
+            json.field("path", path)
+            json.field("max_regression_percent", plan.max_regression)
+            json.field("deltas") do
+              json.array do
+                verdict.deltas.each do |d|
+                  json.object do
+                    json.field("metric", d.metric)
+                    json.field("before", round3(d.before))
+                    json.field("after", round3(d.after))
+                    json.field("change_percent", round3(d.change_percent))
+                  end
+                end
+              end
+            end
+          end
+        end
+      else
+        json.field("baseline", nil)
+      end
+      json.field("gates") do
+        json.object do
+          json.field("passed", verdict.passed?)
+          json.field("evaluated") { json.array { verdict.gates.each { |g| gate_object(json, g) } } }
+          json.field("breached") { json.array { verdict.breached.each { |g| gate_object(json, g) } } }
+        end
+      end
+      json.field("verdict") do
+        json.object do
+          json.field("exit_code", verdict.exit_code)
+          json.field("reason", verdict.reason)
+        end
+      end
+    end
+  end
+end
+
+# ── CSV ────────────────────────────────────────────────────────────────────
+
+def csv_cell(text : String) : String
+  return text unless text.includes?(",") || text.includes?("\"") || text.includes?("\n")
+  "\"" + text.gsub("\"", "\"\"") + "\""
+end
+
+# A header and one row: the run in a line that a history file grows by.
+pub def to_csv(plan : Plan, outcome : Outcome, verdict : Verdict) : String
+  t = outcome.tally
+  h = t.latency
+  c = t.corrected
+  header = "title,requests,responses,ok,failed,transport_errors,elapsed_seconds,requests_per_second,failure_rate_percent,avg_ms,p50_ms,p90_ms,p95_ms,p99_ms,p999_ms,max_ms,corrected_p50_ms,corrected_p99_ms,total_bytes,exit_code,reason"
+  cells = [csv_cell(plan.title), t.requests.to_s, t.responses.to_s, t.ok.to_s, t.failed.to_s, t.faults.to_s,
+           sprintf("%.3f", outcome.elapsed_s), sprintf("%.3f", requests_per_second(outcome)), sprintf("%.3f", failure_percent(t)),
+           sprintf("%.3f", h.avg), sprintf("%.3f", h.percentile(50.0)), sprintf("%.3f", h.percentile(90.0)),
+           sprintf("%.3f", h.percentile(95.0)), sprintf("%.3f", h.percentile(99.0)), sprintf("%.3f", h.percentile(99.9)),
+           sprintf("%.3f", h.maximum), sprintf("%.3f", c.percentile(50.0)), sprintf("%.3f", c.percentile(99.0)),
+           t.bytes.to_s, verdict.exit_code.to_s, verdict.reason]
+  header + "\n" + cells.join(",") + "\n"
+end
+
+# ── text and markdown ──────────────────────────────────────────────────────
+
+# ANSI color, when the plan says the terminal takes it.
+class Paint
+  def initialize(@on : Bool)
+  end
+
+  def wrap(code : String, text : String) : String
+    @on ? "\e[#{code}m#{text}\e[0m" : text
+  end
+
+  def bold(text : String) : String
+    wrap("1", text)
+  end
+
+  def dim(text : String) : String
+    wrap("2", text)
+  end
+
+  def green(text : String) : String
+    wrap("32", text)
+  end
+
+  def red(text : String) : String
+    wrap("31", text)
+  end
+
+  def yellow(text : String) : String
+    wrap("33", text)
+  end
+
+  def cyan(text : String) : String
+    wrap("36", text)
+  end
+end
+
+def shape(plan : Plan, outcome : Outcome) : String
+  parts = [] of String
+  parts << "#{plan.connections} connection#{plan.connections == 1 ? "" : "s"} on #{outcome.workers} worker#{outcome.workers == 1 ? "" : "s"}"
+  parts << format_duration(plan.duration_ns) if plan.duration_ns > 0
+  parts << "#{grouped(plan.requests)} requests" if plan.requests > 0
+  parts << (plan.rate > 0.0 ? sprintf("%g req/s", plan.rate) : "unpaced")
+  parts << (plan.keepalive ? "keep-alive" : "no keep-alive")
+  parts << "warmup #{format_duration(plan.warmup_ns)}" if plan.warmup_ns > 0
+  parts.join(" · ")
+end
+
+def latency_row(label : String, h : Histogram) : String
+  cells = [h.avg, h.percentile(50.0), h.percentile(90.0), h.percentile(95.0), h.percentile(99.0), h.percentile(99.9), h.maximum]
+  "  " + label.ljust(11) + cells.map { |v| ms_text(v).rjust(9) }.join("")
+end
+
+def bar(share : Float64, width : Int32) : String
+  full = (share / 100.0 * width.to_f).round.to_i32
+  full = 1 if full == 0 && share > 0.0
+  "█" * full
+end
+
+def gate_line(g : GateResult, p : Paint) : String
+  mark = g.passed ? p.green("✔") : p.red("✘")
+  latency = g.metric.includes?("p") && !g.metric.includes?("per_second") && !g.metric.includes?("percent") || g.metric.ends_with?("avg") || g.metric.ends_with?("max")
+  shown_actual = latency ? ms_text(g.actual) : sprintf("%.2f", g.actual)
+  shown_limit = latency ? ms_text(g.limit) : sprintf("%.2f", g.limit)
+  scope = g.scope == "global" ? "" : p.dim(" [#{g.scope}]")
+  "  #{mark} #{g.name.ljust(24)} #{g.metric} #{shown_actual} #{g.comparator} #{shown_limit}#{scope}"
+end
+
+pub def to_text(plan : Plan, outcome : Outcome, verdict : Verdict) : String
+  p = Paint.new(plan.color)
+  t = outcome.tally
+  rps = requests_per_second(outcome)
+  elapsed = outcome.elapsed_s
+  correct = correcting?(plan)
+  String.build do |io|
+    io << "\n" << p.bold("iyl #{version}") << "  " << p.cyan(plan.title) << "\n"
+    io << "  " << p.dim(shape(plan, outcome)) << "\n\n"
+
+    io << p.bold("Summary") << "\n"
+    io << "  Requests     " << grouped(t.requests).rjust(12) << "   " << decimal(rps) << " req/s over " << sprintf("%.2fs", elapsed) << "\n"
+    ok_share = percent(t.ok, t.requests)
+    io << "  Succeeded    " << grouped(t.ok).rjust(12) << "   " << (ok_share >= 100.0 ? p.green(sprintf("%.2f%%", ok_share)) : sprintf("%.2f%%", ok_share)) << "\n"
+    failed = t.failed + t.faults
+    failed_text = grouped(failed).rjust(12)
+    io << "  Failed       " << (failed > 0 ? p.red(failed_text) : failed_text)
+    io << "   " << p.dim("HTTP #{grouped(t.failed)} · transport #{grouped(t.faults)}") if failed > 0
+    io << "\n"
+    io << "  Transferred  " << bytes_text(t.bytes.to_f).rjust(12) << "   " << bytes_text(elapsed > 0.0 ? t.bytes.to_f / elapsed : 0.0) << "/s\n"
+    io << "  Redirects    " << grouped(t.redirects).rjust(12) << "\n" if t.redirects > 0
+    io << "  Abandoned    " << grouped(t.abandoned).rjust(12) << "   " << p.dim("in flight when the run was cut short") << "\n" if t.abandoned > 0
+    io << "\n"
+
+    if t.responses > 0
+      io << p.bold("Latency") << "     " << ["avg", "p50", "p90", "p95", "p99", "p99.9", "max"].map(&.rjust(9)).join("") << "\n"
+      io << latency_row("service", t.latency) << "\n"
+      if plan.rate > 0.0
+        io << latency_row("corrected", t.corrected) << "\n"
+        io << latency_row("send delay", t.send_delay) << "\n"
+      end
+      io << "\n"
+      io << p.bold("Phases") << "        count" << ["avg", "p50", "p95", "p99"].map(&.rjust(9)).join("") << "\n"
+      [{"dns", t.dns}, {"connect", t.connect}, {"tls", t.tls}, {"ttfb", t.ttfb}].each do |pair|
+        h = pair[1]
+        next if h.empty?
+        io << "  " << pair[0].ljust(9) << grouped(h.count).rjust(10)
+        io << [h.avg, h.percentile(50.0), h.percentile(95.0), h.percentile(99.0)].map { |v| ms_text(v).rjust(9) }.join("") << "\n"
+      end
+      io << "\n"
+      io << p.bold("Distribution") << p.dim(correct ? "  (corrected)" : "") << "\n"
+      (correct ? t.corrected : t.latency).bins(10).each do |bin|
+        io << "  " << ms_text(bin.start_ms).rjust(9) << " " << p.cyan(bar(bin.percent, 30).ljust(30)) << " "
+        io << sprintf("%5.1f%%", bin.percent) << "  " << p.dim(grouped(bin.count)) << "\n"
+      end
+      io << "\n"
+    end
+
+    unless t.statuses.empty?
+      io << p.bold("Status codes") << "\n"
+      t.statuses.keys.sorted.each do |code|
+        s = t.statuses[code]
+        label = code.to_s
+        label = plan.success?(code) ? p.green(label) : p.red(label)
+        io << "  " << label << "  " << grouped(s.count).rjust(10) << sprintf("  %6.2f%%", percent(s.count, t.responses))
+        io << p.dim("   p50 #{ms_text(s.latency.percentile(50.0))}  p99 #{ms_text(s.latency.percentile(99.0))}") << "\n"
+      end
+      io << "\n"
+    end
+
+    unless t.fault_kinds.empty?
+      io << p.bold("Transport errors") << "\n"
+      fault_categories.each do |kind|
+        f = t.fault_kinds[kind]?
+        next unless f.is_a?(FaultTally)
+        io << "  " << p.red(kind.ljust(18)) << grouped(f.count).rjust(10) << "   " << p.dim(f.sample) << "\n"
+      end
+      io << "\n"
+    end
+
+    if plan.rate > 0.0
+      io << p.bold("Schedule") << "\n"
+      attained = rps * 100.0 / plan.rate
+      asked = plan.rate == plan.rate.round ? grouped(plan.rate.to_i64) : sprintf("%g", plan.rate)
+      line = "  requested #{asked}/s · attained #{decimal(rps)}/s (#{sprintf("%.1f%%", attained)})"
+      io << (attained < 99.0 ? p.yellow(line) : line) << "\n"
+      io << "  scheduled " << grouped(outcome.scheduled) << " · issued " << grouped(outcome.issued)
+      skipped = outcome.skipped
+      io << " · skipped " << (skipped > 0 ? p.yellow(grouped(skipped)) : "0")
+      io << " · worst send delay " << ms_text(t.send_delay.maximum) << "\n\n"
+    end
+
+    unless t.urls.empty?
+      io << p.bold("Per URL") << "\n"
+      plan.targets.each do |prep|
+        u = t.urls[prep.index]
+        h = correct ? u.corrected : u.latency
+        io << "  " << p.cyan("#{prep.method} #{prep.target.url}") << "\n"
+        io << "    " << grouped(u.requests) << " requests · " << decimal(elapsed > 0.0 ? u.requests.to_f / elapsed : 0.0) << " req/s"
+        io << sprintf(" · %.2f%% failed", percent(u.failed + u.faults, u.requests))
+        io << " · p50 " << ms_text(h.percentile(50.0)) << " · p99 " << ms_text(h.percentile(99.0)) << "\n"
+      end
+      io << "\n"
+    end
+
+    unless verdict.deltas.empty?
+      io << p.bold("Against baseline") << p.dim(" (#{plan.baseline_path})") << "\n"
+      verdict.deltas.each do |d|
+        change = d.change_percent
+        worse = d.higher_better ? change < 0.0 : change > 0.0
+        shown = sprintf("%+.1f%%", change)
+        shown = worse ? p.red(shown) : p.green(shown) if change.abs >= 0.05
+        latency = !d.metric.includes?("per_second") && !d.metric.includes?("percent")
+        before = latency ? ms_text(d.before) : sprintf("%.2f", d.before)
+        after = latency ? ms_text(d.after) : sprintf("%.2f", d.after)
+        io << "  " << d.metric.ljust(24) << before.rjust(10) << " → " << after.ljust(10) << " " << shown << "\n"
+      end
+      io << "\n"
+    end
+
+    unless verdict.gates.empty?
+      io << p.bold("Gates") << "\n"
+      verdict.gates.each { |g| io << gate_line(g, p) << "\n" }
+      io << "\n"
+    end
+
+    word = case verdict.exit_code
+           when 0 then p.green(p.bold("PASS"))
+           when 1 then p.red(p.bold("FAIL"))
+           when 3 then p.red(p.bold("UNREACHABLE"))
+           else        p.yellow(p.bold("INTERRUPTED"))
+           end
+    io << word << "  " << p.dim("#{verdict.reason}, exit #{verdict.exit_code}") << "\n"
+  end
+end
+
+# GitHub-flavoured Markdown, for a job summary or a pull request comment.
+pub def to_markdown(plan : Plan, outcome : Outcome, verdict : Verdict) : String
+  t = outcome.tally
+  rps = requests_per_second(outcome)
+  correct = correcting?(plan)
+  String.build do |io|
+    icon = verdict.exit_code == 0 ? "✅" : "❌"
+    io << "### " << icon << " iyl: `" << plan.title << "`\n\n"
+    io << shape(plan, outcome) << "\n\n"
+    io << "| Requests | req/s | Succeeded | Failed | Transport errors | Elapsed |\n|---:|---:|---:|---:|---:|---:|\n"
+    io << "| " << grouped(t.requests) << " | " << decimal(rps) << " | " << sprintf("%.2f%%", percent(t.ok, t.requests))
+    io << " | " << grouped(t.failed) << " | " << grouped(t.faults) << " | " << sprintf("%.2fs", outcome.elapsed_s) << " |\n\n"
+    io << "| Latency | avg | p50 | p90 | p95 | p99 | p99.9 | max |\n|---|---:|---:|---:|---:|---:|---:|---:|\n"
+    rows = [{"service", t.latency}]
+    rows << {"corrected", t.corrected} if plan.rate > 0.0
+    rows.each do |row|
+      h = row[1]
+      cells = [h.avg, h.percentile(50.0), h.percentile(90.0), h.percentile(95.0), h.percentile(99.0), h.percentile(99.9), h.maximum]
+      io << "| " << row[0] << " | " << cells.map { |v| ms_text(v) }.join(" | ") << " |\n"
+    end
+    io << "\n"
+    unless t.statuses.empty?
+      io << "| Status | Count | Share | p99 |\n|---:|---:|---:|---:|\n"
+      t.statuses.keys.sorted.each do |code|
+        s = t.statuses[code]
+        io << "| " << code << " | " << grouped(s.count) << " | " << sprintf("%.2f%%", percent(s.count, t.responses)) << " | " << ms_text(s.latency.percentile(99.0)) << " |\n"
+      end
+      io << "\n"
+    end
+    unless t.fault_kinds.empty?
+      io << "| Transport error | Count |\n|---|---:|\n"
+      fault_categories.each do |kind|
+        f = t.fault_kinds[kind]?
+        io << "| " << kind << " | " << grouped(f.count) << " |\n" if f.is_a?(FaultTally)
+      end
+      io << "\n"
+    end
+    unless t.urls.empty?
+      io << "| URL | Requests | req/s | Failed | p50 | p99 |\n|---|---:|---:|---:|---:|---:|\n"
+      plan.targets.each do |prep|
+        u = t.urls[prep.index]
+        h = correct ? u.corrected : u.latency
+        io << "| `" << prep.method << " " << prep.target.url << "` | " << grouped(u.requests) << " | "
+        io << decimal(outcome.elapsed_s > 0.0 ? u.requests.to_f / outcome.elapsed_s : 0.0) << " | "
+        io << sprintf("%.2f%%", percent(u.failed + u.faults, u.requests)) << " | " << ms_text(h.percentile(50.0)) << " | " << ms_text(h.percentile(99.0)) << " |\n"
+      end
+      io << "\n"
+    end
+    unless verdict.deltas.empty?
+      io << "| Against baseline | Before | After | Change |\n|---|---:|---:|---:|\n"
+      verdict.deltas.each do |d|
+        latency = !d.metric.includes?("per_second") && !d.metric.includes?("percent")
+        before = latency ? ms_text(d.before) : sprintf("%.2f", d.before)
+        after = latency ? ms_text(d.after) : sprintf("%.2f", d.after)
+        io << "| " << d.metric << " | " << before << " | " << after << " | " << sprintf("%+.1f%%", d.change_percent) << " |\n"
+      end
+      io << "\n"
+    end
+    unless verdict.gates.empty?
+      io << "| Gate | Scope | Metric | Actual | Limit | |\n|---|---|---|---:|---:|:-:|\n"
+      verdict.gates.each do |g|
+        io << "| " << g.name << " | " << g.scope << " | " << g.metric << " | " << sprintf("%.3f", g.actual) << " | "
+        io << g.comparator << " " << sprintf("%.3f", g.limit) << " | " << (g.passed ? "✅" : "❌") << " |\n"
+      end
+      io << "\n"
+    end
+    io << "**" << verdict.reason << "**, exit " << verdict.exit_code << "\n"
+  end
+end
