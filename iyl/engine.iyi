@@ -300,7 +300,9 @@ def work(plan : Plan, live : Live, index : Int32) : Tally
   seed = Random.new.next_u.to_u64
   group do |g|
     mine.times do |k|
-      g.spawn do
+      # In the worker's unit: its connections take turns on the tally,
+      # which is why it needs no lock.
+      g.spawn(unit: :same) do
         agent = Agent.new(plan, live, tally, dns, tls, seed &+ k.to_u64)
         agent.drive(false, live.start_ns) if plan.warmup_ns > 0
         agent.drive(true, live.deadline_ns)
@@ -354,13 +356,15 @@ pub def run(plan : Plan) : Outcome
   live = Live.new(start, deadline, interval)
   ctl = Control.new
   tallies = [] of Tally
+  # The run, the ticker and the signal watcher share `ctl` and the console,
+  # so they stay on the main thread's unit, taking turns.
   group do |g|
-    g.spawn do
+    g.spawn(unit: :same) do
       group do |wg|
         ctl.workers = wg
         handles = [] of IyiTask(Tally)
         plan.workers.times do |index|
-          handles << wg.spawn_parallel { work(plan, live, index) }
+          handles << wg.spawn(unit: :new) { work(plan, live, index) }
         end
         handles.each do |handle|
           got = handle.value
@@ -377,7 +381,7 @@ pub def run(plan : Plan) : Outcome
       g.cancel_children
       0
     end
-    g.spawn do
+    g.spawn(unit: :same) do
       shown = 0_i64
       until ctl.finished
         break if sleep(100).is_a?(Cancelled)
@@ -396,7 +400,7 @@ pub def run(plan : Plan) : Outcome
       end
       0
     end
-    g.spawn do
+    g.spawn(unit: :same) do
       {% if flag?(:win32) %}
         Signal.each(Signal::INT) do |sig|
           exit 130 if ctl.signal != 0

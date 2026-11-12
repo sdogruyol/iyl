@@ -1,3 +1,4 @@
+@[Unsafe("each connection reads into a fixed buffer of its own, and responses are parsed in place there; every index stays below BUFFER")]
 module iyl/wire
 
 import std/socket::{IyiSocket, SocketError, IPAddress, IPv4Address, DnsError}
