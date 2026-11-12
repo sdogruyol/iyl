@@ -1,0 +1,141 @@
+module iyl/plan
+
+import std/list::{List}
+import std/base64::{Base64}
+import std/text
+import iyl/target::{Target}
+
+pub def version : String
+  "1.0.0"
+end
+
+# A URL ready to be sent: the request's bytes written once, at startup, so
+# the hot loop sends a string it already has.
+pub class Prepared
+  getter index : Int32
+  getter target : Target
+  getter method : String
+  # The whole request as it goes on the wire.
+  getter request : String
+  # What follows the request target on the request line, for a request whose
+  # path changes each time (`--random-path`).
+  getter tail : String
+  getter head_request : Bool
+
+  def initialize(@index : Int32, @target : Target, @method : String, @request : String, @tail : String)
+    @head_request = @method == "HEAD"
+  end
+end
+
+# One CI gate: a metric compared to a limit, over the whole run or over the
+# URLs whose text holds `scope`.
+pub class Gate
+  # The flag it came from: `max-p99`, `min-rps`, `max-fail-rate`, ...
+  getter name : String
+  # `global`, or the pattern a `--url-threshold` scoped it to.
+  getter scope : String
+  getter limit : Float64
+
+  def initialize(@name : String, @scope : String, @limit : Float64)
+  end
+end
+
+# Everything a run needs, decided before it starts and never written after:
+# every worker thread reads the same one (SPEC.md III.4.4).
+pub class Plan
+  getter targets : List(Prepared)
+  getter method : String
+  getter body : String
+  # Every header sent, in order, after `Host`.
+  getter headers : List(Tuple(String, String))
+  getter connections : Int32
+  getter workers : Int32
+  # Requests to send in all; 0 when the run is bounded by time.
+  getter requests : Int64
+  getter duration_ns : Int64
+  getter warmup_ns : Int64
+  # Requests a second, the schedule every worker shares; 0 for as fast as
+  # the target answers.
+  getter rate : Float64
+  getter timeout_ms : Int32
+  getter request_timeout_ns : Int64
+  getter keepalive : Bool
+  getter follow_redirects : Bool
+  getter max_redirects : Int32
+  getter proxy : Target | Nil
+  getter proxy_auth : String | Nil
+  # Certificates (PEM) a server's chain may lead to, besides the system's.
+  getter cacert : String | Nil
+  getter random_path : Bool
+  getter success : List(Tuple(Int32, Int32))
+  getter success_text : String
+  getter format : String
+  getter save_path : String | Nil
+  getter progress : Bool
+  getter color : Bool
+  getter latency_correction : Bool
+  getter gates : List(Gate)
+  getter fail_on_error : Bool
+  getter fail_on_transport_error : Bool
+  getter fail_on_rate_miss : Bool
+  getter baseline_path : String | Nil
+  getter baseline_text : String | Nil
+  getter max_regression : Float64
+
+  def initialize(@targets : List(Prepared), @method : String, @body : String, @headers : List(Tuple(String, String)),
+                 @connections : Int32, @workers : Int32, @requests : Int64, @duration_ns : Int64, @warmup_ns : Int64,
+                 @rate : Float64, @timeout_ms : Int32, @request_timeout_ns : Int64, @keepalive : Bool,
+                 @follow_redirects : Bool, @max_redirects : Int32, @proxy : Target | Nil, @proxy_auth : String | Nil,
+                 @cacert : String | Nil, @random_path : Bool, @success : List(Tuple(Int32, Int32)), @success_text : String,
+                 @format : String, @save_path : String | Nil, @progress : Bool, @color : Bool, @latency_correction : Bool,
+                 @gates : List(Gate), @fail_on_error : Bool, @fail_on_transport_error : Bool, @fail_on_rate_miss : Bool,
+                 @baseline_path : String | Nil, @baseline_text : String | Nil, @max_regression : Float64)
+  end
+
+  def success?(status : Int32) : Bool
+    @success.any? { |range| status >= range[0] && status <= range[1] }
+  end
+
+  # The URL a report is titled with.
+  def title : String
+    first = @targets[0].target.url
+    @targets.size > 1 ? "#{first} (+#{@targets.size - 1} more)" : first
+  end
+end
+
+# The request line's target: the path, or the whole URL when the request
+# goes to a proxy in the clear (RFC 9112 section 3.2.2).
+pub def request_target(target : Target, path : String, proxy : Target | Nil) : String
+  proxy.is_a?(Target) && !target.tls? ? "#{target.origin}#{path}" : path
+end
+
+# Whether a request with this method carries a body's length even when it
+# has none: the methods a body belongs to.
+def body_method?(method : String) : Bool
+  method == "POST" || method == "PUT" || method == "PATCH"
+end
+
+# The bytes of a request after its target: the version, `Host`, the run's
+# headers, the target's own credentials, and the body framed by its length.
+pub def request_tail(target : Target, method : String, body : String, headers : List(Tuple(String, String)), proxy : Target | Nil, proxy_auth : String | Nil, host_header : String | Nil) : String
+  String.build(256 + body.bytesize) do |io|
+    io << " HTTP/1.1\r\nHost: "
+    io << (host_header || target.authority)
+    io << "\r\n"
+    headers.each do |pair|
+      io << pair[0] << ": " << pair[1] << "\r\n"
+    end
+    info = target.userinfo
+    if info.is_a?(String) && !headers.any? { |pair| pair[0].downcase == "authorization" }
+      io << "Authorization: Basic " << Base64.encode(info) << "\r\n"
+    end
+    if proxy.is_a?(Target) && !target.tls? && proxy_auth.is_a?(String)
+      io << "Proxy-Authorization: " << proxy_auth << "\r\n"
+    end
+    if !body.empty? || body_method?(method)
+      io << "Content-Length: " << body.bytesize << "\r\n"
+    end
+    io << "\r\n"
+    io << body
+  end
+end

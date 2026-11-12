@@ -1,0 +1,108 @@
+module test/cli_test
+
+import iyl/cli::{parse_args, parse_statuses, Help, ShowVersion}
+import iyl/plan::{Plan}
+import iyl/fault::{ConfigError}
+
+def parse(args : Array(String))
+  parse_args(args, false, false, false) { "piped" }
+end
+
+def plan(args : Array(String)) : Plan
+  got = parse(args)
+  raise "not a plan: #{got.inspect}" unless got.is_a?(Plan)
+  got
+end
+
+def refusal(args : Array(String)) : String
+  got = parse(args)
+  raise "not refused: #{got.inspect}" unless got.is_a?(ConfigError)
+  got.message
+end
+
+test "a URL alone runs for ten seconds on ten connections" do
+  p = plan(["http://h.test/"])
+  assert_eq 10_000_000_000_i64, p.duration_ns
+  assert_eq 0_i64, p.requests
+  assert_eq 10, p.connections
+  assert p.workers >= 1 && p.workers <= 10
+  assert_eq 10_000, p.timeout_ms
+  assert p.keepalive
+end
+
+test "a request count alone has no time bound, and no more connections than requests" do
+  p = plan(["http://h.test/", "-n", "3", "-c", "50", "-w", "8"])
+  assert_eq 0_i64, p.duration_ns
+  assert_eq 3, p.connections
+  assert_eq 3, p.workers
+end
+
+test "values are read in each spelling" do
+  assert_eq 7_i64, plan(["http://h.test/", "--requests=7"]).requests
+  assert_eq 7_i64, plan(["http://h.test/", "-n7"]).requests
+  assert_eq 2.5, plan(["-q", "2.5", "http://h.test/"]).rate
+  assert_eq 30_000_000_000_i64, plan(["http://h.test/", "-d", "30s"]).duration_ns
+end
+
+test "the request is written once, with its headers in order" do
+  p = plan(["http://h.test:81/x", "-m", "post", "-b", "abc", "-H", "X-A: 1", "--bearer", "tok"])
+  request = p.targets[0].request
+  assert request.starts_with?("POST /x HTTP/1.1\r\nHost: h.test:81\r\nUser-Agent: iyl/")
+  assert request.includes?("\r\nAuthorization: Bearer tok\r\n")
+  assert request.includes?("\r\nX-A: 1\r\n")
+  assert request.ends_with?("\r\nContent-Length: 3\r\n\r\nabc")
+end
+
+test "a Host header given is the one sent, and Connection: close turns keep-alive off" do
+  p = plan(["http://10.0.0.1/", "-H", "Host: api.test", "-H", "Connection: close"])
+  assert p.targets[0].request.includes?("\r\nHost: api.test\r\n")
+  assert !p.keepalive
+  assert p.targets[0].request.includes?("\r\nConnection: close\r\n")
+end
+
+test "an unknown option is refused with a guess" do
+  assert_includes refusal(["http://h.test/", "--duratoin", "5s"]), "Did you mean --duration?"
+end
+
+test "usage mistakes say what to write" do
+  assert_includes refusal([] of String), "no URL"
+  assert_includes refusal(["http://h.test/", "-c", "0"]), "-c"
+  assert_includes refusal(["http://h.test/", "-d"]), "needs a value"
+  assert_includes refusal(["http://h.test/", "-o", "xml"]), "text, json"
+  assert_includes refusal(["http://h.test/", "-b", "a", "--body-stdin"]), "give the body once"
+  assert_includes refusal(["http://h.test/", "-H", "Content-Length: 5"]), "iyl's to write"
+  assert_includes refusal(["http://h.test/", "--max-p99", "fast"]), "--max-p99"
+  assert_includes refusal(["http://h.test/", "--latency-correction", "maybe"]), "on or off"
+  assert_includes refusal(["http://h.test/", "--cacert", "missing.pem"]), "does not exist"
+end
+
+test "a scoped gate must match a URL under load" do
+  assert_includes refusal(["http://h.test/a", "--url-threshold", "/b max-p99 100"]), "matches none"
+  assert_includes refusal(["http://h.test/a", "--url-threshold", "/a p99 100"]), "is not one of"
+  p = plan(["http://h.test/a", "--url-threshold", "/a max-p99 1.5s"])
+  assert_eq 1500.0, p.gates[0].limit
+  assert_eq "/a", p.gates[0].scope
+end
+
+test "gates read milliseconds or a unit" do
+  p = plan(["http://h.test/", "--max-p99", "250", "--max-avg", "1s", "--min-rps", "100", "--max-fail-rate", "0.5"])
+  assert_eq ["max-p99", "max-avg", "min-rps", "max-fail-rate"], p.gates.map(&.name)
+  assert_eq [250.0, 1000.0, 100.0, 0.5], p.gates.map(&.limit)
+end
+
+test "success statuses are codes and ranges" do
+  ranges = parse_statuses("200-299, 304").or_panic
+  assert_eq 2, ranges.size
+  assert_eq({304, 304}, ranges[1])
+  assert parse_statuses("299-200").is_a?(ConfigError)
+  assert parse_statuses("700").is_a?(ConfigError)
+end
+
+test "help and version are answers, not errors" do
+  assert parse(["-h"]).is_a?(Help)
+  assert parse(["http://h.test/", "--version"]).is_a?(ShowVersion)
+end
+
+test "the body may come from standard input" do
+  assert_eq "piped", plan(["http://h.test/", "--body-stdin", "-m", "PUT"]).body
+end

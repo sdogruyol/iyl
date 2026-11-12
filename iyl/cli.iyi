@@ -1,0 +1,491 @@
+module iyl/cli
+
+import std/list::{List}
+import std/text
+import std/base64::{Base64}
+import std/levenshtein
+import std/system::{System}
+import std/math::{Math}
+import std/x509::{Certificate, X509Error}
+import std/json::{JSON}
+import iyl/fault::{ConfigError}
+import iyl/duration::{parse_duration}
+import iyl/target::{Target, parse_target}
+import iyl/plan::{Plan, Prepared, Gate, version, request_target, request_tail}
+
+# Asked for the help text: printed, and the program exits 0.
+pub struct Help
+  def initialize
+  end
+end
+
+# Asked for the version: printed, and the program exits 0.
+pub struct ShowVersion
+  def initialize
+  end
+end
+
+# The metrics a gate may name, as a `--url-threshold` writes them; the
+# global flags are these with `--` in front.
+pub def gate_names : Array(String)
+  ["max-p50", "max-p75", "max-p90", "max-p95", "max-p99", "max-p999", "max-avg",
+   "max-latency", "min-rps", "max-fail-rate"]
+end
+
+# Flags that take a value, by every spelling.
+def valued : Array(String)
+  ["-n", "--requests", "-d", "--duration", "-c", "--connections", "-w", "--workers",
+   "-q", "--rate", "--warmup", "--timeout", "--request-timeout", "--max-redirects",
+   "-m", "--method", "-b", "--body", "--body-file", "-H", "--header", "-a", "--basic-auth",
+   "--bearer", "--user-agent", "--host-header", "--content-type", "--cookie", "--urls-file",
+   "--proxy", "--cacert", "--success-status", "-o", "--output-format", "--save",
+   "--latency-correction", "--url-threshold", "--baseline", "--max-regression",
+   "--max-p50", "--max-p75", "--max-p90", "--max-p95", "--max-p99", "--max-p999",
+   "--max-avg", "--max-latency", "--min-rps", "--max-fail-rate"]
+end
+
+# Flags that stand alone.
+def switches : Array(String)
+  ["-h", "--help", "-V", "--version", "--body-stdin", "--disable-keepalive", "--no-keepalive",
+   "-L", "--follow-redirects", "--random-path", "--json", "--progress", "--no-progress",
+   "--no-color", "--fail-on-error", "--fail-on-transport-error", "--fail-on-rate-miss"]
+end
+
+def unknown(flag : String) : ConfigError
+  names = valued + switches
+  guess = Levenshtein.find(flag, names.select { |n| n.starts_with?("--") })
+  hint = guess.is_a?(String) ? " Did you mean #{guess}?" : ""
+  ConfigError.new("unknown option #{flag}.#{hint} See iyl --help.")
+end
+
+def positive_int(text : String, flag : String) : Int32 | ConfigError
+  n = text.strip.to_i?
+  return ConfigError.new("#{flag} needs a whole number of at least 1, got '#{text}'") unless n.is_a?(Int32) && n >= 1
+  n
+end
+
+def positive_float(text : String, flag : String) : Float64 | ConfigError
+  n = text.strip.to_f?
+  return ConfigError.new("#{flag} needs a number above 0, got '#{text}'") unless n.is_a?(Float64) && n > 0.0
+  n
+end
+
+# A latency limit: milliseconds when bare, or a duration with its unit.
+def limit_ms(text : String, flag : String) : Float64 | ConfigError
+  bare = text.strip.to_f?
+  if bare.is_a?(Float64)
+    return ConfigError.new("#{flag} needs a limit of 0 or more, got '#{text}'") if bare < 0.0
+    return bare
+  end
+  ns = parse_duration(text, flag)!
+  ns.to_f / 1_000_000.0
+end
+
+def gate_limit(name : String, text : String, flag : String) : Float64 | ConfigError
+  if name == "min-rps" || name == "max-fail-rate"
+    n = text.strip.to_f?
+    return ConfigError.new("#{flag} needs a number of 0 or more, got '#{text}'") unless n.is_a?(Float64) && n >= 0.0
+    return n
+  end
+  limit_ms(text, flag)
+end
+
+# `200-299,304`: codes and ranges of codes a response counts as a success by.
+pub def parse_statuses(text : String) : List(Tuple(Int32, Int32)) | ConfigError
+  ranges = [] of Tuple(Int32, Int32)
+  text.split(',').each do |piece|
+    part = piece.strip
+    next if part.empty?
+    bounds = part.split('-')
+    return ConfigError.new("--success-status cannot read '#{part}': write codes and ranges such as 200-299,304") if bounds.size > 2
+    low = bounds[0].strip.to_i?
+    high = bounds.size == 2 ? bounds[1].strip.to_i? : low
+    unless low.is_a?(Int32) && high.is_a?(Int32) && low >= 100 && high <= 599 && low <= high
+      return ConfigError.new("--success-status cannot read '#{part}': a status is a number from 100 to 599")
+    end
+    ranges << {low, high}
+  end
+  return ConfigError.new("--success-status names no status") if ranges.empty?
+  List.new(ranges)
+end
+
+# The URLs of a file, one a line, each optionally after its method:
+# `POST https://api.test/orders`. Blank lines and `#` comments are skipped.
+def read_urls_file(path : String) : Array(Tuple(String, String | Nil)) | ConfigError
+  return ConfigError.new("--urls-file #{path} does not exist") unless File.exists?(path)
+  found = [] of Tuple(String, String | Nil)
+  File.read(path).lines.each do |raw|
+    line = raw.strip
+    next if line.empty? || line.starts_with?("#")
+    words = line.split
+    if words.size == 2
+      found << {words[1], words[0].upcase}
+    elsif words.size == 1
+      found << {words[0], nil}
+    else
+      return ConfigError.new("--urls-file #{path}: cannot read '#{line}': write a URL, or a method and a URL")
+    end
+  end
+  return ConfigError.new("--urls-file #{path} holds no URL") if found.empty?
+  found
+end
+
+def token?(text : String) : Bool
+  return false if text.empty?
+  text.each_char do |c|
+    return false unless c.ascii_alphanumeric? || "!#$%&'*+-.^_`|~".includes?(c.to_s)
+  end
+  true
+end
+
+def read_file(path : String, flag : String) : String | ConfigError
+  return ConfigError.new("#{flag} #{path} does not exist") unless File.exists?(path)
+  File.read(path)
+end
+
+# Reads the command line into a plan, or says why it cannot run. The
+# terminal flags decide what is shown live and in color; the block reads
+# standard input, called only for `--body-stdin`.
+pub def parse_args(args : Array(String), stdout_tty : Bool, stderr_tty : Bool, no_color : Bool, &read_stdin : -> String) : Plan | Help | ShowVersion | ConfigError
+  urls = [] of Tuple(String, String | Nil)
+  requests = 0_i64
+  duration_ns = 0_i64
+  connections = 10
+  workers = 0
+  rate = 0.0
+  warmup_ns = 0_i64
+  timeout_ms = 10_000
+  request_timeout_ns = 0_i64
+  keepalive = true
+  follow = false
+  max_redirects = 10
+  method = "GET"
+  method_given = false
+  body = nil
+  body_sources = 0
+  headers = [] of Tuple(String, String)
+  basic = nil
+  bearer = nil
+  user_agent = "iyl/#{version}"
+  host_header = nil
+  content_type = nil
+  cookies = [] of String
+  urls_file = nil
+  proxy_text = nil
+  cacert_path = nil
+  random_path = false
+  success_text = "200-299"
+  format = "text"
+  save_path = nil
+  progress = stderr_tty
+  color = stdout_tty && !no_color
+  correction = true
+  gates = [] of Gate
+  url_gates = [] of Tuple(String, String, String)
+  fail_on_error = false
+  fail_on_transport = false
+  fail_on_rate_miss = false
+  baseline_path = nil
+  max_regression = 10.0
+
+  i = 0
+  while i < args.size
+    arg = args[i]
+    i += 1
+    if !arg.starts_with?("-") || arg == "-"
+      urls << {arg, nil}
+      next
+    end
+    if arg == "--"
+      while i < args.size
+        urls << {args[i], nil}
+        i += 1
+      end
+      break
+    end
+    flag = arg
+    value = nil
+    if arg.starts_with?("--") && arg.includes?("=")
+      eq = arg.index('=').as(Int32)
+      flag = arg[0, eq]
+      value = arg[eq + 1, arg.bytesize - eq - 1]
+    elsif !arg.starts_with?("--") && arg.bytesize > 2 && valued.includes?(arg[0, 2])
+      flag = arg[0, 2]
+      value = arg[2, arg.bytesize - 2]
+    end
+    if switches.includes?(flag)
+      return ConfigError.new("#{flag} takes no value") unless value.nil?
+      case flag
+      when "-h", "--help"    then return Help.new
+      when "-V", "--version" then return ShowVersion.new
+      when "--body-stdin"
+        body = read_stdin.call
+        body_sources += 1
+      when "--disable-keepalive", "--no-keepalive" then keepalive = false
+      when "-L", "--follow-redirects"              then follow = true
+      when "--random-path"                         then random_path = true
+      when "--json"                                then format = "json"
+      when "--progress"                            then progress = true
+      when "--no-progress"                         then progress = false
+      when "--no-color"                            then color = false
+      when "--fail-on-error"                       then fail_on_error = true
+      when "--fail-on-transport-error"             then fail_on_transport = true
+      when "--fail-on-rate-miss"                   then fail_on_rate_miss = true
+      end
+      next
+    end
+    return unknown(flag) unless valued.includes?(flag)
+    if value.nil?
+      return ConfigError.new("#{flag} needs a value") if i >= args.size
+      value = args[i]
+      i += 1
+    end
+    v = value.as(String)
+    case flag
+    when "-n", "--requests"
+      n = v.strip.to_i64?
+      return ConfigError.new("#{flag} needs a whole number of at least 1, got '#{v}'") unless n.is_a?(Int64) && n >= 1
+      requests = n
+    when "-d", "--duration"
+      duration_ns = parse_duration(v, flag)!
+      return ConfigError.new("#{flag} must be longer than 0") if duration_ns <= 0
+    when "-c", "--connections" then connections = positive_int(v, flag)!
+    when "-w", "--workers"     then workers = positive_int(v, flag)!
+    when "-q", "--rate"        then rate = positive_float(v, flag)!
+    when "--warmup"            then warmup_ns = parse_duration(v, flag)!
+    when "--timeout"
+      ns = parse_duration(v, flag)!
+      timeout_ms = (ns // 1_000_000_i64).to_i32
+      timeout_ms = 1 if ns > 0 && timeout_ms == 0
+    when "--request-timeout" then request_timeout_ns = parse_duration(v, flag)!
+    when "--max-redirects"
+      n = v.strip.to_i?
+      return ConfigError.new("#{flag} needs a whole number of 0 or more") unless n.is_a?(Int32) && n >= 0
+      max_redirects = n
+    when "-m", "--method"
+      method = v.strip.upcase
+      method_given = true
+      return ConfigError.new("#{flag} '#{v}' is not an HTTP method") unless token?(method)
+    when "-b", "--body"
+      body = v
+      body_sources += 1
+    when "--body-file"
+      body = read_file(v, flag)!
+      body_sources += 1
+    when "-H", "--header"
+      colon = v.index(':')
+      return ConfigError.new("#{flag} '#{v}' is not a header: write it as 'Name: value'") unless colon.is_a?(Int32)
+      name = v[0, colon].strip
+      text = v[colon + 1, v.bytesize - colon - 1].strip
+      return ConfigError.new("#{flag} '#{v}' has no name before its colon") unless token?(name)
+      return ConfigError.new("#{flag} '#{name}' holds a line break") if text.includes?("\r") || text.includes?("\n")
+      lower = name.downcase
+      if lower == "host"
+        host_header = text
+      elsif lower == "content-length" || lower == "transfer-encoding"
+        return ConfigError.new("#{flag} #{name} is iyl's to write: it frames the body it sends")
+      elsif lower == "connection" && text.downcase == "close"
+        keepalive = false
+      elsif lower == "user-agent"
+        user_agent = text
+      else
+        headers << {name, text}
+      end
+    when "-a", "--basic-auth"
+      return ConfigError.new("#{flag} needs user:password") unless v.includes?(":")
+      basic = v
+    when "--bearer"       then bearer = v.strip
+    when "--user-agent"   then user_agent = v
+    when "--host-header"  then host_header = v.strip
+    when "--content-type" then content_type = v.strip
+    when "--cookie"
+      return ConfigError.new("#{flag} '#{v}' is not a cookie: write it as name=value") unless v.includes?("=")
+      cookies << v.strip
+    when "--urls-file"      then urls_file = v
+    when "--proxy"          then proxy_text = v
+    when "--cacert"         then cacert_path = v
+    when "--success-status" then success_text = v
+    when "-o", "--output-format"
+      format = v.strip.downcase
+      format = "markdown" if format == "md"
+      unless ["text", "json", "csv", "markdown", "quiet"].includes?(format)
+        return ConfigError.new("#{flag} '#{v}' is not one of text, json, csv, markdown, quiet")
+      end
+    when "--save" then save_path = v
+    when "--latency-correction"
+      case v.strip.downcase
+      when "on", "true", "yes"  then correction = true
+      when "off", "false", "no" then correction = false
+      else
+        return ConfigError.new("#{flag} is on or off, got '#{v}'")
+      end
+    when "--url-threshold"
+      words = v.split
+      return ConfigError.new("#{flag} '#{v}' must be 'PATTERN METRIC VALUE'") if words.size < 3
+      metric = words[words.size - 2]
+      return ConfigError.new("#{flag} '#{v}': #{metric} is not one of #{gate_names.join(", ")}") unless gate_names.includes?(metric)
+      pattern = words[0, words.size - 2].join(" ")
+      url_gates << {pattern, metric, words[words.size - 1]}
+    when "--baseline" then baseline_path = v
+    when "--max-regression"
+      n = v.strip.chomp("%").to_f?
+      return ConfigError.new("#{flag} needs a percentage of 0 or more") unless n.is_a?(Float64) && n >= 0.0
+      max_regression = n
+    else
+      name = flag[2, flag.bytesize - 2]
+      gates << Gate.new(name, "global", gate_limit(name, v, flag)!)
+    end
+  end
+
+  if path = urls_file
+    read_urls_file(path)!.each { |pair| urls << pair }
+  end
+  return ConfigError.new("no URL to load: give one or more, or --urls-file. See iyl --help.") if urls.empty?
+  return ConfigError.new("give the body once: -b, --body-file and --body-stdin each set it") if body_sources > 1
+  duration_ns = 10_000_000_000_i64 if requests == 0 && duration_ns == 0
+  return ConfigError.new("--warmup cannot be negative") if warmup_ns < 0
+  success = parse_statuses(success_text)!
+
+  proxy = nil
+  proxy_auth = nil
+  if text = proxy_text
+    parsed = parse_target(text)
+    return ConfigError.new("--proxy: #{parsed.message}") if parsed.is_a?(ConfigError)
+    return ConfigError.new("--proxy #{text}: only http:// proxies are spoken to") if parsed.tls?
+    proxy = parsed
+    info = parsed.userinfo
+    proxy_auth = "Basic #{Base64.encode(info)}" if info.is_a?(String)
+  end
+
+  cacert = nil
+  if path = cacert_path
+    pem = read_file(path, "--cacert")!
+    roots = Certificate.from_pem(pem)
+    return ConfigError.new("--cacert #{path}: #{roots.message}") if roots.is_a?(X509Error)
+    return ConfigError.new("--cacert #{path} holds no certificate") if roots.empty?
+    cacert = pem
+  end
+
+  baseline_text = nil
+  if path = baseline_path
+    text = read_file(path, "--baseline")!
+    parsed = JSON.parse?(text)
+    return ConfigError.new("--baseline #{path} is not a JSON report (one written by --json or --save)") if parsed.nil? || parsed["latency_ms"]?.nil?
+    baseline_text = text
+  end
+
+  sent_body = body || ""
+  all = [] of Tuple(String, String)
+  all << {"User-Agent", user_agent}
+  all << {"Accept", "*/*"} unless headers.any? { |h| h[0].downcase == "accept" }
+  if b = basic
+    all << {"Authorization", "Basic #{Base64.encode(b)}"}
+  elsif t = bearer
+    all << {"Authorization", "Bearer #{t}"}
+  end
+  all << {"Content-Type", content_type.as(String)} if content_type
+  all << {"Cookie", cookies.join("; ")} unless cookies.empty?
+  headers.each { |h| all << h }
+  all << {"Connection", "close"} unless keepalive
+  header_list = List.new(all)
+
+  prepared = [] of Prepared
+  urls.each_with_index do |pair, index|
+    target = parse_target(pair[0], pair[1])!
+    verb = pair[1] || method
+    tail = request_tail(target, verb, sent_body, header_list, proxy, proxy_auth, host_header)
+    line = "#{verb} #{request_target(target, target.path, proxy)}"
+    prepared << Prepared.new(index, target, verb, line + tail, tail)
+  end
+
+  url_gates.each do |gate|
+    unless prepared.any? { |p| p.target.url.includes?(gate[0]) }
+      return ConfigError.new("--url-threshold '#{gate[0]}' matches none of the URLs under load")
+    end
+    gates << Gate.new(gate[1], gate[0], gate_limit(gate[1], gate[2], "--url-threshold")!)
+  end
+  return ConfigError.new("--url-threshold needs per-URL results, which runs of more than 1000 URLs do not keep") if !url_gates.empty? && prepared.size > 1000
+
+  connections = requests.to_i32 if requests > 0 && requests < connections.to_i64
+  workers = Math.min(System.cpu_count, connections) if workers == 0
+  workers = connections if workers > connections
+
+  Plan.new(List.new(prepared), method, sent_body, header_list, connections, workers, requests, duration_ns, warmup_ns,
+    rate, timeout_ms, request_timeout_ns, keepalive, follow, max_redirects, proxy, proxy_auth, cacert, random_path,
+    success, success_text, format, save_path, progress, color && format == "text", correction, List.new(gates),
+    fail_on_error, fail_on_transport, fail_on_rate_miss, baseline_path, baseline_text, max_regression)
+end
+
+pub def usage : String
+  <<-TEXT
+  iyl #{version}: HTTP load testing that tells the truth, built for CI.
+
+  Usage: iyl [options] <url>...
+
+  Load:
+    -n, --requests N            send N requests in all
+    -d, --duration TIME         run for TIME: 30, 30s, 2m, 1h30m, 500ms (default 10s)
+                                with -n too, the run ends at whichever comes first
+    -c, --connections N         connections open at once (default 10)
+    -w, --workers N             threads driving them (default: cores, at most N connections)
+    -q, --rate R                requests a second across all connections, fractions allowed;
+                                each request is then also timed from its scheduled slot
+        --warmup TIME           load without measuring first; its connections stay open
+        --timeout TIME          bound on each connect, read and write (default 10s, 0 for none)
+        --request-timeout TIME  bound on a whole request, body included
+        --disable-keepalive     a new connection for every request, its setup counted
+    -L, --follow-redirects      follow 3xx answers, as one request
+        --max-redirects N       redirects followed at most (default 10)
+
+  Request:
+    -m, --method METHOD         HTTP method (default GET)
+    -b, --body TEXT             request body
+        --body-file PATH        request body from a file
+        --body-stdin            request body from standard input
+    -H, --header 'K: V'         header, repeatable
+        --content-type TYPE     Content-Type of the body
+    -a, --basic-auth USER:PASS  Basic credentials
+        --bearer TOKEN          Bearer credentials
+        --cookie NAME=VALUE     cookie, repeatable
+        --user-agent TEXT       User-Agent (default iyl/#{version})
+        --host-header HOST      Host header, for a server behind its address
+        --urls-file PATH        URLs one a line, optionally after a method: 'POST https://...'
+        --random-path           a random segment on every path, past caches
+        --proxy URL             send through an HTTP proxy (CONNECT for https)
+        --cacert PATH           trust the certificates in this PEM file, not the system's
+        --success-status LIST   statuses that count as success (default 200-299), e.g. 200-299,304
+
+  Output:
+    -o, --output-format FMT     text, json, csv, markdown or quiet (default text)
+        --json                  same as --output-format json
+        --save PATH             also write the JSON report to PATH
+        --progress, --no-progress
+                                live progress on stderr (default: when stderr is a terminal)
+        --no-color              plain text (also when NO_COLOR is set)
+
+  Gates (any breach exits 1):
+        --max-p50/--max-p75/--max-p90/--max-p95/--max-p99/--max-p999 MS
+        --max-avg MS            average latency
+        --max-latency MS        slowest request
+                                (MS is milliseconds, or a time with its unit: 1.5s)
+        --min-rps N             throughput
+        --max-fail-rate PCT     failed requests, HTTP and transport, in percent
+        --fail-on-error         any failed request
+        --fail-on-transport-error
+                                any request that got no HTTP answer
+        --fail-on-rate-miss     the run fell more than 1% short of --rate
+        --url-threshold 'PATTERN METRIC VALUE'
+                                a gate for the URLs containing PATTERN, repeatable;
+                                METRIC: #{gate_names.join(" ")}
+        --latency-correction on|off
+                                gate latency measured from the schedule (default on)
+        --baseline PATH         compare with an earlier JSON report
+        --max-regression PCT    allowed slowdown against --baseline (default 10)
+
+    -h, --help                  this text
+    -V, --version               the version
+
+  Exit codes: 0 passed, 1 a gate breached, 2 bad usage, 3 target unreachable,
+  130 interrupted, 143 terminated.
+  TEXT
+end
