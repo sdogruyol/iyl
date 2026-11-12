@@ -35,8 +35,8 @@ iyl is built from source with the iyi toolchain, 0.21.0 or later
 
 ```sh
 git clone https://github.com/sdogruyol/iyl && cd iyl
-iyi build --release -o iyl iyl.iyi
-./iyl --version
+mkdir -p bin && iyi build --release -o bin/iyl iyl.iyi
+bin/iyl --version
 ```
 
 The result is a single executable with no runtime to install and no OpenSSL:
@@ -289,7 +289,7 @@ generator rather than a claim about any network.
 ```sh
 iyi test                                         # every test/*_test.iyi
 iyi run test/support/target_server.iyi -- 3000   # a target to point iyl at
-iyi build -o iyl iyl.iyi && ./iyl http://127.0.0.1:3000/bytes/1024 -d 5s
+mkdir -p bin && iyi build -o bin/iyl iyl.iyi && bin/iyl http://127.0.0.1:3000/bytes/1024 -d 5s
 ```
 
 The end-to-end tests run iyl against servers in their own process: plain,

@@ -37,12 +37,13 @@ jobs:
         run: iyi test
 
       - name: Build
-        run: iyi build --release -o iyl iyl.iyi
+        shell: bash
+        run: mkdir -p bin && iyi build --release -o bin/iyl iyl.iyi
 
       - name: Smoke
         shell: bash
         run: |
-          iyi build --release -o target_server test/support/target_server.iyi
-          ./target_server 3000 &
+          iyi build --release -o bin/target_server test/support/target_server.iyi
+          bin/target_server 3000 &
           sleep 1
-          ./iyl http://127.0.0.1:3000/ -d 2s -c 8 --max-p99 1s --save result.json -o markdown >> "$GITHUB_STEP_SUMMARY"
+          bin/iyl http://127.0.0.1:3000/ -d 2s -c 8 --max-p99 1s --save result.json -o markdown >> "$GITHUB_STEP_SUMMARY"

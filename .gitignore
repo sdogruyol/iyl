@@ -1,7 +1,5 @@
-# Build outputs: the binary sits beside its own source directory, iyl/.
-/iyl
-!/iyl/
-/target_server
+# Build outputs go to bin/: `iyl` itself is the source directory.
+/bin/
 *.exe
 *.pdb
 *.obj
