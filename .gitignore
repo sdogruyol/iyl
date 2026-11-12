@@ -1,0 +1,11 @@
+# Build outputs: the binary sits beside its own source directory, iyl/.
+/iyl
+!/iyl/
+/target_server
+*.exe
+*.pdb
+*.obj
+*.o
+*.iyimod
+result.json
+baseline_e2e.json
