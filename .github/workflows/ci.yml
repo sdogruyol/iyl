@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install iyi (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/iyilang/iyi/master/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install iyi (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://raw.githubusercontent.com/iyilang/iyi/master/install.ps1 | iex
+          "$env:LOCALAPPDATA\Programs\iyi\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Format
+        run: iyi fmt --check iyl.iyi iyl test
+
+      - name: Test
+        run: iyi test
+
+      - name: Build
+        run: iyi build --release -o iyl iyl.iyi
+
+      - name: Smoke
+        shell: bash
+        run: |
+          iyi build --release -o target_server test/support/target_server.iyi
+          ./target_server 3000 &
+          sleep 1
+          ./iyl http://127.0.0.1:3000/ -d 2s -c 8 --max-p99 1s --save result.json -o markdown >> "$GITHUB_STEP_SUMMARY"
