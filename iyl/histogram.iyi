@@ -1,0 +1,203 @@
+module iyl/histogram
+
+import std/math::{Math}
+
+# Values are milliseconds. Buckets grow by 1% from a microsecond to an hour,
+# so any percentile is within 1% of the value it stands for, in 2,203
+# counters instead of one per sample.
+MIN_MS     =       0.001
+MAX_MS     = 3_600_000.0
+GROWTH     =        1.01
+LOG_GROWTH = Math.log(1.01)
+BUCKETS    = 2203
+
+pub def bucket_index(ms : Float64) : Int32
+  return 0 if ms <= MIN_MS
+  index = (Math.log(ms / MIN_MS) / LOG_GROWTH).floor.to_i32
+  index < BUCKETS - 1 ? index : BUCKETS - 1
+end
+
+# The geometric middle of a bucket: the best single value for what fell in it.
+pub def bucket_value(index : Int32) : Float64
+  MIN_MS * Math.exp((index.to_f + 0.5) * LOG_GROWTH)
+end
+
+# One bar of a histogram drawn with even widths.
+pub struct Bin
+  getter start_ms : Float64
+  getter end_ms : Float64
+  getter count : Int64
+  getter percent : Float64
+
+  def initialize(@start_ms : Float64, @end_ms : Float64, @count : Int64, @percent : Float64)
+  end
+end
+
+# A distribution of latencies. Dense keeps a counter per bucket and records in
+# one index; sparse keeps only the buckets touched, for the breakdowns (per
+# URL, per status) that would otherwise hold 17 KB each. Mean and variance are
+# Welford's, so they are exact rather than read off the buckets, and two
+# histograms merge exactly (Chan et al.).
+pub class Histogram
+  getter count : Int64
+  getter sum : Float64
+  @min : Float64
+  @max : Float64
+  @mean : Float64
+  @m2 : Float64
+  @dense : Array(Int64)
+  @sparse : Hash(Int32, Int64)
+  @is_dense : Bool
+
+  def initialize(dense : Bool = true)
+    @count = 0_i64
+    @sum = 0.0
+    @min = 0.0
+    @max = 0.0
+    @mean = 0.0
+    @m2 = 0.0
+    @is_dense = dense
+    @dense = dense ? Array(Int64).new(BUCKETS, 0_i64) : [] of Int64
+    @sparse = {} of Int32 => Int64
+  end
+
+  def empty? : Bool
+    @count == 0
+  end
+
+  def record(ms : Float64) : Nil
+    value = ms < 0.0 ? 0.0 : ms
+    if @count == 0
+      @min = value
+      @max = value
+    else
+      @min = value if value < @min
+      @max = value if value > @max
+    end
+    @count += 1
+    @sum += value
+    delta = value - @mean
+    @mean += delta / @count.to_f
+    @m2 += delta * (value - @mean)
+    add_bucket(bucket_index(value), 1_i64)
+  end
+
+  private def add_bucket(index : Int32, n : Int64) : Nil
+    if @is_dense
+      @dense[index] = @dense[index] + n
+    else
+      @sparse[index] = (@sparse[index]? || 0_i64) + n
+    end
+  end
+
+  # Every non-empty bucket, in order, to the block.
+  def each_bucket(& : Int32, Int64 -> Nil) : Nil
+    if @is_dense
+      i = 0
+      while i < BUCKETS
+        n = @dense[i]
+        yield i, n if n > 0
+        i += 1
+      end
+    else
+      @sparse.keys.sorted.each { |i| yield i, @sparse[i] }
+    end
+  end
+
+  def merge(other : Histogram) : Nil
+    return if other.empty?
+    if @count == 0
+      @min = other.minimum
+      @max = other.maximum
+      @mean = other.mean
+      @m2 = other.m2
+    else
+      @min = other.minimum if other.minimum < @min
+      @max = other.maximum if other.maximum > @max
+      total = (@count + other.count).to_f
+      delta = other.mean - @mean
+      @mean += delta * other.count.to_f / total
+      @m2 += other.m2 + delta * delta * @count.to_f * other.count.to_f / total
+    end
+    @count += other.count
+    @sum += other.sum
+    other.each_bucket { |i, n| add_bucket(i, n) }
+  end
+
+  def mean : Float64
+    @mean
+  end
+
+  def m2 : Float64
+    @m2
+  end
+
+  def avg : Float64
+    @count == 0 ? 0.0 : @sum / @count.to_f
+  end
+
+  def minimum : Float64
+    @count == 0 ? 0.0 : @min
+  end
+
+  def maximum : Float64
+    @count == 0 ? 0.0 : @max
+  end
+
+  # The sample standard deviation.
+  def stdev : Float64
+    return 0.0 if @count < 2
+    Math.sqrt(@m2 / (@count - 1).to_f)
+  end
+
+  # The value at or below which *p* percent of the samples fall (the
+  # nearest-rank definition), within a bucket's 1%, never outside the
+  # observed minimum and maximum.
+  def percentile(p : Float64) : Float64
+    return 0.0 if @count == 0
+    rank = (@count.to_f * p / 100.0).ceil.to_i64
+    rank = 1_i64 if rank < 1
+    seen = 0_i64
+    found = -1
+    each_bucket do |i, n|
+      if found < 0
+        seen += n
+        found = i if seen >= rank
+      end
+    end
+    return @max if found < 0
+    value = bucket_value(found)
+    return @min if value < @min
+    return @max if value > @max
+    value
+  end
+
+  # The buckets rolled up into *bins* bars between the minimum and the
+  # maximum, each spanning the same ratio rather than the same width: a
+  # latency tail spans orders of magnitude, and even widths put nearly
+  # every sample in the first bar.
+  def bins(bins : Int32 = 10) : Array(Bin)
+    answer = [] of Bin
+    return answer if @count == 0
+    low = @min > MIN_MS ? @min : MIN_MS
+    if @max <= low || bucket_index(low) == bucket_index(@max)
+      answer << Bin.new(@min, @max, @count, 100.0)
+      return answer
+    end
+    ratio = Math.log(@max / low)
+    counts = Array(Int64).new(bins, 0_i64)
+    each_bucket do |i, n|
+      value = bucket_value(i)
+      at = value <= low ? 0 : (Math.log(value / low) / ratio * bins.to_f).floor.to_i32
+      at = 0 if at < 0
+      at = bins - 1 if at > bins - 1
+      counts[at] = counts[at] + n
+    end
+    bins.times do |b|
+      start = b == 0 ? @min : low * Math.exp(ratio * b.to_f / bins.to_f)
+      stop = b == bins - 1 ? @max : low * Math.exp(ratio * (b + 1).to_f / bins.to_f)
+      answer << Bin.new(start, stop, counts[b], counts[b].to_f * 100.0 / @count.to_f)
+    end
+    answer
+  end
+end

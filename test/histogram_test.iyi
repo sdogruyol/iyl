@@ -1,0 +1,64 @@
+module test/histogram_test
+
+import iyl/histogram::{Histogram, bucket_index, bucket_value}
+
+test "percentiles land within a bucket's 1% of the true value" do
+  h = Histogram.new
+  (1..1000).each { |i| h.record(i.to_f) }
+  assert_in_delta 500.0, h.percentile(50.0), 5.0
+  assert_in_delta 990.0, h.percentile(99.0), 10.0
+  assert_eq 1000.0, h.percentile(100.0)
+  assert_eq 1.0, h.minimum
+  assert_eq 1000.0, h.maximum
+  assert_in_delta 500.5, h.avg, 0.0001
+end
+
+test "a percentile never leaves the observed range" do
+  h = Histogram.new
+  h.record(7.3)
+  assert_eq 7.3, h.percentile(50.0)
+  assert_eq 7.3, h.percentile(99.9)
+end
+
+test "an empty histogram answers zeros" do
+  h = Histogram.new
+  assert_eq 0.0, h.percentile(99.0)
+  assert_eq 0.0, h.stdev
+  assert_eq 0, h.bins.size
+end
+
+test "merging sparse into dense is exact for count, mean and variance" do
+  whole = Histogram.new
+  a = Histogram.new
+  b = Histogram.new(dense: false)
+  (1..100).each do |i|
+    v = i.to_f * 1.5
+    whole.record(v)
+    if i.even?
+      a.record(v)
+    else
+      b.record(v)
+    end
+  end
+  a.merge(b)
+  assert_eq whole.count, a.count
+  assert_in_delta whole.avg, a.avg, 0.000001
+  assert_in_delta whole.stdev, a.stdev, 0.000001
+  assert_eq whole.percentile(90.0), a.percentile(90.0)
+end
+
+test "bins cover every sample once" do
+  h = Histogram.new
+  (1..500).each { |i| h.record(i.to_f / 10.0) }
+  bins = h.bins(10)
+  assert_eq 10, bins.size
+  assert_eq 500_i64, bins.sum { |b| b.count }
+  assert_eq h.minimum, bins.first.start_ms
+  assert_eq h.maximum, bins.last.end_ms
+end
+
+test "buckets grow by one percent" do
+  i = bucket_index(10.0)
+  assert_in_delta 10.0, bucket_value(i), 0.1
+  assert bucket_index(10.0) < bucket_index(10.2)
+end
