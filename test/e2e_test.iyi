@@ -1,0 +1,218 @@
+module test/e2e_test
+
+# The whole program against a server in this process: the command line read
+# into a plan, the load driven over real sockets, the verdict and the report.
+import std/socket::{IyiSocket}
+import std/http::{Server, Response, Request}
+import std/json::{JSON}
+import std/text
+import iyl/cli::{parse_args}
+import iyl/plan::{Plan}
+import iyl/engine::{run, Outcome}
+import iyl/verdict::{judge, Verdict}
+import iyl/report::{to_json, to_text, to_csv, to_markdown}
+
+class Seen
+  getter requests = [] of Request
+
+  def initialize
+  end
+end
+
+def answer(req : Request, seen : Seen) : Response
+  seen.requests << req
+  path = req.path
+  if path.starts_with?("/status/")
+    Response.new(path[8, 3].to_i, "status")
+  elsif path.starts_with?("/slow/")
+    sleep(path[6, path.bytesize - 6].to_i)
+    Response.new(200, "slow")
+  elsif path == "/redirect"
+    Response.new(302, "", {"Location" => "/ok"})
+  elsif path == "/chunked"
+    Response.stream(200) { |w| 3.times { w.write("z" * 700) } }
+  else
+    Response.new(200, "hello")
+  end
+end
+
+def plan_of(args : Array(String)) : Plan
+  parsed = parse_args(args, false, false, true) { "from stdin" }
+  raise "not a plan: #{parsed.inspect}" unless parsed.is_a?(Plan)
+  parsed
+end
+
+def load(args : Array(String)) : Tuple(Plan, Outcome, Verdict)
+  plan = plan_of(args)
+  outcome = run(plan)
+  {plan, outcome, judge(plan, outcome)}
+end
+
+listener = IyiSocket.listen("127.0.0.1", 0)
+base = "http://127.0.0.1:#{listener.local_port}"
+seen = Seen.new
+stop = Channel(Int32).new(1)
+
+group do |g|
+  g.spawn do
+    stop.receive
+    listener.close
+    0
+  end
+  g.spawn do
+    Server.serve(listener, workers: 1) { |req| answer(req, seen) }
+    0
+  end
+  g.spawn do
+    test "a request count is met exactly, every answer counted" do
+      plan, outcome, verdict = load(["#{base}/ok", "-n", "50", "-c", "5"])
+      t = outcome.tally
+      assert_eq 50_i64, t.requests
+      assert_eq 50_i64, t.ok
+      assert_eq 0_i64, t.faults
+      assert_eq 250_i64, t.bytes
+      assert_eq 5_i64, t.connect.count
+      assert_eq 50_i64, t.ttfb.count
+      assert_eq 0, verdict.exit_code
+      assert outcome.workers <= 5
+    end
+
+    test "the method, body and headers asked for are what the server gets" do
+      seen.requests.clear
+      load(["#{base}/echo", "-n", "1", "-m", "post", "-b", "{\"a\":1}", "--content-type", "application/json",
+            "-H", "X-Trace: 42", "-a", "user:pw", "--cookie", "a=1", "--cookie", "b=2", "--user-agent", "probe/1"])
+      req = seen.requests.first
+      assert_eq "POST", req.method
+      assert_eq "{\"a\":1}", req.body
+      assert_eq "application/json", req.header("Content-Type")
+      assert_eq "42", req.header("X-Trace")
+      assert_eq "Basic dXNlcjpwdw==", req.header("Authorization")
+      assert_eq "a=1; b=2", req.header("Cookie")
+      assert_eq "probe/1", req.header("User-Agent")
+    end
+
+    test "a body read from standard input is sent" do
+      seen.requests.clear
+      load(["#{base}/echo", "-n", "1", "-m", "PUT", "--body-stdin"])
+      assert_eq "from stdin", seen.requests.first.body
+    end
+
+    test "statuses outside the success list fail the requests, and a gate on them" do
+      plan, outcome, verdict = load(["#{base}/status/503", "-n", "20", "-c", "2", "--max-fail-rate", "5"])
+      assert_eq 20_i64, outcome.tally.failed
+      assert_eq 20_i64, outcome.tally.statuses[503].count
+      assert_eq 1, verdict.exit_code
+      assert_eq "failure_rate_percent", verdict.breached.first.metric
+      _, ok_outcome, ok_verdict = load(["#{base}/status/503", "-n", "5", "--success-status", "200-299,503"])
+      assert_eq 5_i64, ok_outcome.tally.ok
+      assert_eq 0, ok_verdict.exit_code
+    end
+
+    test "without keep-alive every request pays for its connection" do
+      _, outcome, _ = load(["#{base}/ok", "-n", "30", "-c", "3", "--disable-keepalive"])
+      assert_eq 30_i64, outcome.tally.ok
+      assert_eq 30_i64, outcome.tally.connect.count
+    end
+
+    test "redirects followed are one request; unfollowed, a 302 is a failure" do
+      _, outcome, _ = load(["#{base}/redirect", "-n", "10", "-c", "1", "-L"])
+      assert_eq 10_i64, outcome.tally.ok
+      assert_eq 10_i64, outcome.tally.redirects
+      assert_eq 10_i64, outcome.tally.statuses[200].count
+      _, plain, _ = load(["#{base}/redirect", "-n", "10", "-c", "1"])
+      assert_eq 10_i64, plain.tally.failed
+    end
+
+    test "a chunked body is counted whole" do
+      _, outcome, _ = load(["#{base}/chunked", "-n", "4", "-c", "1"])
+      assert_eq 8400_i64, outcome.tally.bytes
+    end
+
+    test "a paced run keeps to its schedule" do
+      plan, outcome, verdict = load(["#{base}/ok", "-d", "1s", "-q", "200", "-c", "4", "--fail-on-rate-miss"])
+      t = outcome.tally
+      assert_eq 200_i64, outcome.scheduled
+      assert_eq 0_i64, outcome.skipped
+      assert t.requests >= 198 && t.requests <= 201, "requests #{t.requests}"
+      assert_eq 0, verdict.exit_code
+    end
+
+    test "a stalled target is charged for the wait it caused" do
+      plan, outcome, verdict = load(["#{base}/slow/100", "-d", "1s", "-q", "40", "-c", "1", "--max-p99", "250"])
+      t = outcome.tally
+      assert outcome.skipped >= 15, "skipped #{outcome.skipped}"
+      assert t.latency.percentile(99.0) < 250.0
+      assert t.corrected.percentile(99.0) > 500.0
+      assert_eq 1, verdict.exit_code
+      assert_eq "corrected_p99", verdict.breached.first.metric
+      _, _, off = load(["#{base}/slow/100", "-d", "1s", "-q", "40", "-c", "1", "--max-p99", "250", "--latency-correction", "off"])
+      assert_eq 0, off.exit_code
+    end
+
+    test "a request past its deadline is a request_timeout" do
+      _, outcome, verdict = load(["#{base}/slow/400", "-n", "2", "-c", "1", "--request-timeout", "100ms"])
+      assert_eq ["request_timeout"], outcome.tally.fault_kinds.keys
+      assert_eq 2_i64, outcome.tally.faults
+      assert_eq 3, verdict.exit_code
+    end
+
+    test "every request has a path of its own under --random-path" do
+      seen.requests.clear
+      load(["#{base}/r?q=1", "-n", "5", "-c", "1", "--random-path"])
+      paths = seen.requests.map(&.path)
+      assert_eq 5, paths.uniq.size
+      assert paths.all? { |p| p.starts_with?("/r/") && p.bytesize == 11 }
+      assert seen.requests.all? { |r| r.query == "q=1" }
+    end
+
+    test "URLs share the load in turn, and a scoped gate reads only its own" do
+      plan, outcome, verdict = load([base + "/ok", base + "/status/500", "-n", "40", "-c", "2",
+                                     "--url-threshold", "/ok max-fail-rate 0", "--url-threshold", "status max-p99 5s"])
+      t = outcome.tally
+      assert_eq 20_i64, t.urls[0].requests
+      assert_eq 20_i64, t.urls[1].failed
+      assert_eq 0, verdict.exit_code
+      assert_eq 2, verdict.gates.size
+    end
+
+    test "warmup keeps its connections and counts none of its requests" do
+      _, outcome, _ = load(["#{base}/ok", "-n", "20", "-c", "2", "--warmup", "300ms"])
+      assert_eq 20_i64, outcome.tally.requests
+      assert_eq 0_i64, outcome.tally.connect.count
+    end
+
+    test "an unreachable target exits 3" do
+      dead = IyiSocket.listen("127.0.0.1", 0)
+      port = dead.local_port
+      dead.close
+      _, outcome, verdict = load(["http://127.0.0.1:#{port}/", "-n", "1", "--timeout", "8s"])
+      assert_eq 1_i64, outcome.tally.faults
+      assert_eq 3, verdict.exit_code
+      assert_eq "target_unreachable", verdict.reason
+    end
+
+    test "the JSON report is whole, and a later run reads it as its baseline" do
+      plan, outcome, verdict = load(["#{base}/ok", "-n", "40", "-c", "2", "--max-p99", "1s"])
+      text = to_json(plan, outcome, verdict)
+      json = JSON.parse(text)
+      assert_eq 1_i64, json["schema_version"].as_i64
+      assert_eq 40_i64, json["summary"]["requests"].as_i64
+      assert_eq 0_i64, json["verdict"]["exit_code"].as_i64
+      assert_eq "max-p99", json["gates"]["evaluated"][0]["name"].as_s
+      assert json["urls"].raw.nil?
+      path = "baseline_e2e.json"
+      File.write(path, text)
+      _, later, judged = load(["#{base}/ok", "-n", "40", "-c", "2", "--baseline", path, "--max-regression", "100000"])
+      File.delete(path)
+      assert judged.deltas.size >= 5
+      assert judged.gates.all? { |g| g.scope == "baseline" }
+      assert_eq 0, judged.exit_code
+      assert to_text(plan, later, judged).includes?("Against baseline")
+      assert to_markdown(plan, later, judged).includes?("| Against baseline |")
+      assert_eq 2, to_csv(plan, later, judged).lines.size
+    end
+
+    stop.send(0)
+    0
+  end
+end

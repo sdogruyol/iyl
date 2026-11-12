@@ -1,0 +1,174 @@
+module test/tls_proxy_test
+
+# `https://` against a server whose certificate a test CA issued, which only
+# `--cacert` vouches for, and requests sent through a proxy in absolute form.
+# test/fixtures holds the CA and the server's chain and key (P-256, valid
+# for a century, its CA key thrown away).
+import std/socket::{IyiSocket}
+import std/http::{Server, Response, Request}
+import std/tls::{TlsServerConfig}
+import std/text
+import iyl/cli::{parse_args}
+import iyl/plan::{Plan}
+import iyl/engine::{run, Outcome}
+import iyl/verdict::{judge, Verdict}
+
+def load(args : Array(String)) : Tuple(Outcome, Verdict)
+  plan = parse_args(args, false, false, true) { "" }
+  raise "not a plan: #{plan.inspect}" unless plan.is_a?(Plan)
+  outcome = run(plan)
+  {outcome, judge(plan, outcome)}
+end
+
+# A forward proxy that answers plain requests itself, after keeping their
+# heads, and opens a real tunnel for a CONNECT.
+class FakeProxy
+  getter heads = [] of String
+  # The port a CONNECT is let through to; any other is refused.
+  property tunnel_port : Int32 = 0
+
+  def initialize
+  end
+
+  def serve(client : IyiSocket) : Nil
+    held = ""
+    while true
+      got = client.read(4096)
+      break unless got.is_a?(String)
+      break if got.empty?
+      held += got
+      while (at = held.index("\r\n\r\n")).is_a?(Int32)
+        head = held[0, at]
+        @heads << head
+        held = held[at + 4, held.bytesize - at - 4]
+        if head.starts_with?("CONNECT ")
+          if head.starts_with?("CONNECT localhost:#{@tunnel_port} ")
+            client.write("HTTP/1.1 200 Connection established\r\n\r\n")
+            tunnel(client)
+          else
+            client.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            client.close
+          end
+          return
+        end
+        client.write("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nproxied")
+      end
+    end
+    client.close
+  end
+
+  def tunnel(client : IyiSocket) : Nil
+    server = IyiSocket.connect("127.0.0.1", @tunnel_port).or_panic
+    group do |g|
+      g.spawn { pipe(client, server) }
+      g.spawn { pipe(server, client) }
+    end
+  end
+
+  def pipe(from : IyiSocket, to : IyiSocket) : Int32
+    while true
+      got = from.read(16384)
+      break unless got.is_a?(String) && !got.empty?
+      break unless to.write(got).is_a?(Int32)
+    end
+    from.close unless from.closed?
+    to.close unless to.closed?
+    0
+  end
+
+  # The connection served as a task of *g*: a parameter, so the task holds
+  # the socket itself and not the loop's variable.
+  def start(g : IyiGroup, client : IyiSocket) : Nil
+    g.spawn do
+      serve(client)
+      0
+    end
+  end
+end
+
+ca_path = "test/fixtures/ca.pem"
+config = TlsServerConfig.from_pem(File.read("test/fixtures/server.pem"), File.read("test/fixtures/server.key")).or_panic
+
+tls_listener = IyiSocket.listen("127.0.0.1", 0)
+tls_port = tls_listener.local_port
+proxy_listener = IyiSocket.listen("127.0.0.1", 0)
+proxy_port = proxy_listener.local_port
+proxy = FakeProxy.new
+proxy.tunnel_port = tls_port
+stop = Channel(Int32).new(2)
+
+group do |g|
+  g.spawn do
+    stop.receive
+    tls_listener.close
+    0
+  end
+  g.spawn do
+    stop.receive
+    proxy_listener.close
+    0
+  end
+  g.spawn do
+    Server.serve(tls_listener, tls: config, workers: 1) { |req| Response.new(200, "secure") }
+    0
+  end
+  g.spawn do
+    group do |pg|
+      while true
+        client = proxy_listener.accept
+        break unless client.is_a?(IyiSocket)
+        proxy.start(pg, client)
+      end
+    end
+    0
+  end
+  g.spawn do
+    test "https is spoken under a trusted root, its handshake timed per connection" do
+      outcome, verdict = load(["https://localhost:#{tls_port}/", "-n", "12", "-c", "2", "--cacert", ca_path])
+      t = outcome.tally
+      assert_eq 12_i64, t.ok, t.fault_kinds.values.map(&.sample).join("; ")
+      assert_eq 72_i64, t.bytes
+      assert_eq 2_i64, t.tls.count
+      assert_eq 0, verdict.exit_code
+    end
+
+    test "a certificate nothing vouches for is a tls_error" do
+      outcome, verdict = load(["https://localhost:#{tls_port}/", "-n", "2", "-c", "1"])
+      assert_eq ["tls_error"], outcome.tally.fault_kinds.keys
+      assert_eq 3, verdict.exit_code
+    end
+
+    test "through a proxy, requests go in absolute form with the proxy's credentials" do
+      outcome, verdict = load(["http://origin.test:8080/a?b=1", "-n", "3", "-c", "1",
+                               "--proxy", "http://pu:pp@127.0.0.1:#{proxy_port}"])
+      assert_eq 3_i64, outcome.tally.ok
+      assert_eq 1_i64, outcome.tally.connect.count
+      assert_eq 0_i64, outcome.tally.dns.count
+      first = proxy.heads.first
+      assert first.starts_with?("GET http://origin.test:8080/a?b=1 HTTP/1.1\r\n"), first
+      assert first.includes?("\r\nHost: origin.test:8080\r\n")
+      assert first.includes?("\r\nProxy-Authorization: Basic cHU6cHA="), first
+      assert_eq 0, verdict.exit_code
+    end
+
+    test "https through a proxy goes inside a CONNECT tunnel, checked end to end" do
+      proxy.heads.clear
+      outcome, verdict = load(["https://localhost:#{tls_port}/", "-n", "4", "-c", "1", "--cacert", ca_path,
+                               "--proxy", "127.0.0.1:#{proxy_port}"])
+      assert_eq 4_i64, outcome.tally.ok, outcome.tally.fault_kinds.values.map(&.sample).join("; ")
+      assert_eq 1_i64, outcome.tally.tls.count
+      assert_eq 1, proxy.heads.size
+      assert proxy.heads.first.starts_with?("CONNECT localhost:#{tls_port} HTTP/1.1\r\n"), proxy.heads.first
+      assert_eq 0, verdict.exit_code
+    end
+
+    test "a proxy that refuses the tunnel is a proxy_error" do
+      outcome, _ = load(["https://localhost:1/", "-n", "1", "--cacert", ca_path, "--proxy", "127.0.0.1:#{proxy_port}"])
+      assert_eq ["proxy_error"], outcome.tally.fault_kinds.keys
+    end
+
+    stop.send(0)
+    stop.send(0)
+    0
+  end
+end

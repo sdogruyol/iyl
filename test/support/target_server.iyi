@@ -1,0 +1,53 @@
+module test/support/target_server
+
+# A server to point iyl at while developing and in the end-to-end tests:
+#
+#   iyi run test/support/target_server.iyi -- 3000
+#
+#   /                 "ok"
+#   /bytes/N          N bytes
+#   /chunked/N        N bytes in chunks of 1000
+#   /status/N         an answer with status N
+#   /slow/MS          "ok" after MS milliseconds
+#   /redirect         302 to /
+#   /close            "bye", and the connection closed
+import std/socket::{IyiSocket}
+import std/http::{Server, Response, Request}
+import std/text
+
+def number(path : String, prefix : String) : Int32
+  path[prefix.bytesize, path.bytesize - prefix.bytesize].to_i? || 0
+end
+
+pub def answer(req : Request) : Response
+  path = req.path
+  if path.starts_with?("/bytes/")
+    Response.new(200, "x" * number(path, "/bytes/"))
+  elsif path.starts_with?("/chunked/")
+    n = number(path, "/chunked/")
+    Response.stream(200) do |w|
+      left = n
+      while left > 0
+        piece = left > 1000 ? 1000 : left
+        w.write("y" * piece)
+        left -= piece
+      end
+    end
+  elsif path.starts_with?("/status/")
+    Response.new(number(path, "/status/"), "status")
+  elsif path.starts_with?("/slow/")
+    sleep(number(path, "/slow/"))
+    Response.new(200, "ok")
+  elsif path == "/redirect"
+    Response.new(302, "", {"Location" => "/"})
+  elsif path == "/close"
+    Response.new(200, "bye", {"Connection" => "close"})
+  else
+    Response.new(200, "ok")
+  end
+end
+
+port = (Program.args[0]? || "3000").to_i
+listener = IyiSocket.listen("127.0.0.1", port)
+STDERR.puts "listening on http://127.0.0.1:#{listener.local_port}"
+Server.serve(listener) { |req| answer(req) }
