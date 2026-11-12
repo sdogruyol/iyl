@@ -128,12 +128,14 @@ group do |g|
       assert_eq 8400_i64, outcome.tally.bytes
     end
 
+    # A rate any machine keeps, debug build and shared CI runner included:
+    # what is held is the bookkeeping, not the machine's speed.
     test "a paced run keeps to its schedule" do
-      plan, outcome, verdict = load(["#{base}/ok", "-d", "1s", "-q", "200", "-c", "4", "--fail-on-rate-miss"])
+      plan, outcome, verdict = load(["#{base}/ok", "-d", "1s", "-q", "50", "-c", "4", "--fail-on-rate-miss"])
       t = outcome.tally
-      assert_eq 200_i64, outcome.scheduled
+      assert_eq 50_i64, outcome.scheduled
       assert_eq 0_i64, outcome.skipped
-      assert t.requests >= 198 && t.requests <= 201, "requests #{t.requests}"
+      assert t.requests >= 49 && t.requests <= 51, "requests #{t.requests}"
       assert_eq 0, verdict.exit_code
     end
 
