@@ -1,0 +1,239 @@
+module iyl/tally
+
+import iyl/histogram::{Histogram}
+
+# Responses of one status: how many, and how long they took.
+pub class StatusTally
+  getter count : Int64
+  getter latency : Histogram
+
+  def initialize
+    @count = 0_i64
+    @latency = Histogram.new(dense: false)
+  end
+
+  def add(ms : Float64) : Nil
+    @count += 1
+    @latency.record(ms)
+  end
+
+  def merge(other : StatusTally) : Nil
+    @count += other.count
+    @latency.merge(other.latency)
+  end
+end
+
+# Transport failures of one category, with one sentence kept to show.
+pub class FaultTally
+  getter count : Int64
+  getter sample : String
+
+  def initialize(@sample : String)
+    @count = 0_i64
+  end
+
+  def add : Nil
+    @count += 1
+  end
+
+  def merge(other : FaultTally) : Nil
+    @count += other.count
+  end
+end
+
+# One URL's share of the run.
+pub class UrlTally
+  getter requests : Int64
+  getter responses : Int64
+  getter faults : Int64
+  getter ok : Int64
+  getter failed : Int64
+  getter latency : Histogram
+  getter corrected : Histogram
+
+  def initialize
+    @requests = 0_i64
+    @responses = 0_i64
+    @faults = 0_i64
+    @ok = 0_i64
+    @failed = 0_i64
+    @latency = Histogram.new(dense: false)
+    @corrected = Histogram.new(dense: false)
+  end
+
+  def response(ok : Bool, ms : Float64, corrected_ms : Float64) : Nil
+    @requests += 1
+    @responses += 1
+    if ok
+      @ok += 1
+    else
+      @failed += 1
+    end
+    @latency.record(ms)
+    @corrected.record(corrected_ms)
+  end
+
+  def fault : Nil
+    @requests += 1
+    @faults += 1
+  end
+
+  def merge(other : UrlTally) : Nil
+    @requests += other.requests
+    @responses += other.responses
+    @faults += other.faults
+    @ok += other.ok
+    @failed += other.failed
+    @latency.merge(other.latency)
+    @corrected.merge(other.corrected)
+  end
+end
+
+# Everything one worker measured. A worker's connections take turns on one
+# thread, so they write here without a lock; the workers' tallies are merged
+# once, when the run is over.
+pub class Tally
+  getter requests : Int64
+  getter responses : Int64
+  getter ok : Int64
+  getter failed : Int64
+  getter faults : Int64
+  getter bytes : Int64
+  getter redirects : Int64
+  # Requests in flight when the run was cut short: neither answered nor
+  # failed, and counted nowhere else.
+  getter abandoned : Int64
+  # Schedule slots taken, under `--rate`.
+  getter slots : Int64
+  getter first_ns : Int64
+  getter last_ns : Int64
+  # Service time: from the request's send to its answer's last byte.
+  getter latency : Histogram
+  # Send delay plus service time: from the slot the schedule gave the
+  # request to its answer's last byte.
+  getter corrected : Histogram
+  getter send_delay : Histogram
+  getter dns : Histogram
+  getter connect : Histogram
+  getter tls : Histogram
+  getter ttfb : Histogram
+  getter statuses : Hash(Int32, StatusTally)
+  getter fault_kinds : Hash(String, FaultTally)
+  getter urls : Array(UrlTally)
+
+  def initialize(url_count : Int32)
+    @requests = 0_i64
+    @responses = 0_i64
+    @ok = 0_i64
+    @failed = 0_i64
+    @faults = 0_i64
+    @bytes = 0_i64
+    @redirects = 0_i64
+    @abandoned = 0_i64
+    @slots = 0_i64
+    @first_ns = 0_i64
+    @last_ns = 0_i64
+    @latency = Histogram.new
+    @corrected = Histogram.new
+    @send_delay = Histogram.new
+    @dns = Histogram.new
+    @connect = Histogram.new
+    @tls = Histogram.new
+    @ttfb = Histogram.new
+    @statuses = {} of Int32 => StatusTally
+    @fault_kinds = {} of String => FaultTally
+    @urls = [] of UrlTally
+    url_count.times { @urls << UrlTally.new }
+  end
+
+  def ms(ns : Int64) : Float64
+    ns.to_f / 1_000_000.0
+  end
+
+  def span(start_ns : Int64, end_ns : Int64) : Nil
+    @first_ns = start_ns if @first_ns == 0 || start_ns < @first_ns
+    @last_ns = end_ns if end_ns > @last_ns
+  end
+
+  def setup(dns_ns : Int64, connect_ns : Int64, tls_ns : Int64) : Nil
+    @dns.record(ms(dns_ns)) if dns_ns >= 0
+    @connect.record(ms(connect_ns)) if connect_ns >= 0
+    @tls.record(ms(tls_ns)) if tls_ns >= 0
+  end
+
+  def slot : Nil
+    @slots += 1
+  end
+
+  def redirect : Nil
+    @redirects += 1
+  end
+
+  def abandon : Nil
+    @abandoned += 1
+  end
+
+  # An answer: when the request was due, sent and answered, its first byte,
+  # status and body size.
+  def response(url : Int32, scheduled_ns : Int64, start_ns : Int64, first_byte_ns : Int64, end_ns : Int64, status : Int32, ok : Bool, bytes : Int64) : Nil
+    service = ms(end_ns - start_ns)
+    @requests += 1
+    @responses += 1
+    if ok
+      @ok += 1
+    else
+      @failed += 1
+    end
+    @bytes += bytes
+    @latency.record(service)
+    @corrected.record(ms(end_ns - scheduled_ns))
+    @send_delay.record(ms(start_ns - scheduled_ns))
+    @ttfb.record(ms(first_byte_ns - start_ns))
+    (@statuses[status] ||= StatusTally.new).add(service)
+    @urls[url].response(ok, service, ms(end_ns - scheduled_ns)) unless @urls.empty?
+    span(start_ns, end_ns)
+  end
+
+  # A request that got no HTTP answer.
+  def fault(url : Int32, start_ns : Int64, end_ns : Int64, category : String, detail : String) : Nil
+    @requests += 1
+    @faults += 1
+    (@fault_kinds[category] ||= FaultTally.new(detail)).add
+    @urls[url].fault unless @urls.empty?
+    span(start_ns, end_ns)
+  end
+
+  def merge(other : Tally) : Nil
+    @requests += other.requests
+    @responses += other.responses
+    @ok += other.ok
+    @failed += other.failed
+    @faults += other.faults
+    @bytes += other.bytes
+    @redirects += other.redirects
+    @abandoned += other.abandoned
+    @slots += other.slots
+    span(other.first_ns, other.last_ns) if other.first_ns > 0
+    @latency.merge(other.latency)
+    @corrected.merge(other.corrected)
+    @send_delay.merge(other.send_delay)
+    @dns.merge(other.dns)
+    @connect.merge(other.connect)
+    @tls.merge(other.tls)
+    @ttfb.merge(other.ttfb)
+    other.statuses.each do |code, s|
+      (@statuses[code] ||= StatusTally.new).merge(s)
+    end
+    other.fault_kinds.each do |kind, f|
+      mine = @fault_kinds[kind]?
+      if mine.is_a?(FaultTally)
+        mine.merge(f)
+      else
+        fresh = FaultTally.new(f.sample)
+        fresh.merge(f)
+        @fault_kinds[kind] = fresh
+      end
+    end
+    other.urls.each_with_index { |u, i| @urls[i].merge(u) if i < @urls.size }
+  end
+end
