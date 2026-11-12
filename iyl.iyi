@@ -1,0 +1,39 @@
+module iyl
+
+import std/term::{Term}
+import iyl/cli::{Help, ShowVersion, parse_args, usage}
+import iyl/fault::{ConfigError}
+import iyl/plan::{version}
+import iyl/engine::{run}
+import iyl/verdict::{judge}
+import iyl/report::{to_text, to_json, to_csv, to_markdown}
+
+parsed = parse_args(Program.args, Term.tty?(STDOUT), Term.tty?(STDERR), !Program.env("NO_COLOR").nil?) { STDIN.read_all }
+
+case parsed
+in Help
+  puts usage
+  exit 0
+in ShowVersion
+  puts "iyl #{version}"
+  exit 0
+in ConfigError
+  STDERR.puts "iyl: #{parsed.message}"
+  exit 2
+  # The root module is `Iyl`, so a bare `Plan` here names the module
+  # `iyl/plan` itself; the class is named in full.
+in Iyl::Plan::Plan
+  plan = parsed
+  outcome = run(plan)
+  verdict = judge(plan, outcome)
+  save = plan.save_path
+  File.write(save, to_json(plan, outcome, verdict) + "\n") if save.is_a?(String)
+  case plan.format
+  when "json"     then puts to_json(plan, outcome, verdict)
+  when "csv"      then print to_csv(plan, outcome, verdict)
+  when "markdown" then print to_markdown(plan, outcome, verdict)
+  when "text"     then print to_text(plan, outcome, verdict)
+  end
+  STDOUT.flush
+  exit verdict.exit_code
+end
