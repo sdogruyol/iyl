@@ -11,6 +11,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # The installers read it; a new release is taken on deliberately.
+      IYI_VERSION: "0.21.0"
     steps:
       - uses: actions/checkout@v4
 

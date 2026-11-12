@@ -30,7 +30,7 @@ $ iyl http://localhost:3000/api -d 30s -c 64 --max-p99 250ms
 
 ## Install
 
-iyl is built from source with the iyi toolchain
+iyl is built from source with the iyi toolchain, 0.21.0 or later
 ([install iyi](https://github.com/iyilang/iyi#install)):
 
 ```sh
