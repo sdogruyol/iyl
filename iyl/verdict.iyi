@@ -1,0 +1,202 @@
+module iyl/verdict
+
+import std/json::{JSON, Any}
+import std/text
+import iyl/plan::{Plan, Gate}
+import iyl/engine::{Outcome}
+import iyl/tally::{Tally, UrlTally}
+import iyl/histogram::{Histogram}
+
+# One gate as it was evaluated: what was compared, against what, and
+# whether it held.
+pub struct GateResult
+  getter name : String
+  getter scope : String
+  getter metric : String
+  getter comparator : String
+  getter limit : Float64
+  getter actual : Float64
+  getter passed : Bool
+
+  def initialize(@name : String, @scope : String, @metric : String, @comparator : String, @limit : Float64, @actual : Float64)
+    @passed = @comparator == ">=" ? @actual >= @limit : @actual <= @limit
+  end
+end
+
+# A metric of this run beside the same one of the baseline.
+pub struct Delta
+  getter metric : String
+  getter before : Float64
+  getter after : Float64
+  # Whether a larger value is the better one (throughput) rather than the
+  # worse one (latency, failures).
+  getter higher_better : Bool
+
+  def initialize(@metric : String, @before : Float64, @after : Float64, @higher_better : Bool)
+  end
+
+  def change_percent : Float64
+    return 0.0 if @before == 0.0
+    (@after - @before) * 100.0 / @before
+  end
+end
+
+# What the run comes to: the gates, the comparison with a baseline, and the
+# exit code and the word for it.
+pub class Verdict
+  getter gates : Array(GateResult)
+  getter deltas : Array(Delta)
+  getter exit_code : Int32
+  getter reason : String
+
+  def initialize(@gates : Array(GateResult), @deltas : Array(Delta), @exit_code : Int32, @reason : String)
+  end
+
+  def passed? : Bool
+    @gates.all?(&.passed)
+  end
+
+  def breached : Array(GateResult)
+    @gates.reject(&.passed)
+  end
+end
+
+pub def requests_per_second(outcome : Outcome) : Float64
+  s = outcome.elapsed_s
+  s > 0.0 ? outcome.tally.requests.to_f / s : 0.0
+end
+
+pub def failure_percent(t : Tally) : Float64
+  t.requests > 0 ? (t.failed + t.faults).to_f * 100.0 / t.requests.to_f : 0.0
+end
+
+def percentile_of(name : String) : Float64
+  case name
+  when "max-p50" then 50.0
+  when "max-p75" then 75.0
+  when "max-p90" then 90.0
+  when "max-p95" then 95.0
+  when "max-p99" then 99.0
+  else                99.9
+  end
+end
+
+# The value a latency gate reads off a histogram, and the name it is
+# reported under.
+def latency_metric(name : String, h : Histogram, corrected : Bool) : Tuple(String, Float64)
+  prefix = corrected ? "corrected_" : ""
+  case name
+  when "max-avg"     then {prefix + "avg", h.avg}
+  when "max-latency" then {prefix + "max", h.maximum}
+  else                    {prefix + name[4, name.bytesize - 4], h.percentile(percentile_of(name))}
+  end
+end
+
+def evaluate(gate : Gate, plan : Plan, outcome : Outcome) : GateResult
+  t = outcome.tally
+  correct = plan.latency_correction && plan.rate > 0.0
+  if gate.scope == "global"
+    case gate.name
+    when "min-rps"
+      return GateResult.new(gate.name, gate.scope, "requests_per_second", ">=", gate.limit, requests_per_second(outcome))
+    when "max-fail-rate"
+      return GateResult.new(gate.name, gate.scope, "failure_rate_percent", "<=", gate.limit, failure_percent(t))
+    else
+      metric = latency_metric(gate.name, correct ? t.corrected : t.latency, correct)
+      return GateResult.new(gate.name, gate.scope, metric[0], "<=", gate.limit, metric[1])
+    end
+  end
+  # A scoped gate reads every URL whose text holds its pattern, as one.
+  joined = UrlTally.new
+  plan.targets.each do |p|
+    joined.merge(t.urls[p.index]) if p.target.url.includes?(gate.scope) && p.index < t.urls.size
+  end
+  case gate.name
+  when "min-rps"
+    s = outcome.elapsed_s
+    GateResult.new(gate.name, gate.scope, "requests_per_second", ">=", gate.limit, s > 0.0 ? joined.requests.to_f / s : 0.0)
+  when "max-fail-rate"
+    share = joined.requests > 0 ? (joined.failed + joined.faults).to_f * 100.0 / joined.requests.to_f : 0.0
+    GateResult.new(gate.name, gate.scope, "failure_rate_percent", "<=", gate.limit, share)
+  else
+    metric = latency_metric(gate.name, correct ? joined.corrected : joined.latency, correct)
+    GateResult.new(gate.name, gate.scope, metric[0], "<=", gate.limit, metric[1])
+  end
+end
+
+def number_at(json : Any, section : String, key : String) : Float64 | Nil
+  part = json[section]?
+  return nil if part.nil?
+  value = part[key]?
+  return nil if value.nil?
+  f = value.as_f?
+  return f if f.is_a?(Float64)
+  i = value.as_i64?
+  i.is_a?(Int64) ? i.to_f : nil
+end
+
+# This run beside the report in *text*: the latencies the gates read, the
+# throughput and the failures.
+def compare(text : String, plan : Plan, outcome : Outcome) : Array(Delta)
+  deltas = [] of Delta
+  json = JSON.parse?(text)
+  return deltas if json.nil?
+  t = outcome.tally
+  correct = plan.latency_correction && plan.rate > 0.0
+  section = correct ? "corrected_latency_ms" : "latency_ms"
+  h = correct ? t.corrected : t.latency
+  [{"avg", h.avg}, {"p50", h.percentile(50.0)}, {"p90", h.percentile(90.0)}, {"p99", h.percentile(99.0)}].each do |pair|
+    before = number_at(json, section, pair[0])
+    deltas << Delta.new((correct ? "corrected_" : "") + pair[0], before, pair[1], false) if before.is_a?(Float64)
+  end
+  rps = number_at(json, "summary", "requests_per_second")
+  deltas << Delta.new("requests_per_second", rps, requests_per_second(outcome), true) if rps.is_a?(Float64)
+  fail = number_at(json, "summary", "failure_rate_percent")
+  deltas << Delta.new("failure_rate_percent", fail, failure_percent(t), false) if fail.is_a?(Float64)
+  deltas
+end
+
+# Every gate the plan asked for, evaluated against the outcome, and the exit
+# code: 3 when nothing answered, 1 when a gate is breached, 130 or 143 for a
+# run a signal cut short, 0 otherwise.
+pub def judge(plan : Plan, outcome : Outcome) : Verdict
+  t = outcome.tally
+  results = [] of GateResult
+  plan.gates.each { |gate| results << evaluate(gate, plan, outcome) }
+  if plan.fail_on_error
+    results << GateResult.new("fail-on-error", "global", "failed_requests", "<=", 0.0, (t.failed + t.faults).to_f)
+  end
+  if plan.fail_on_transport_error
+    results << GateResult.new("fail-on-transport-error", "global", "transport_errors", "<=", 0.0, t.faults.to_f)
+  end
+  if plan.fail_on_rate_miss && plan.rate > 0.0
+    attained = requests_per_second(outcome) * 100.0 / plan.rate
+    results << GateResult.new("fail-on-rate-miss", "global", "attainment_percent", ">=", 99.0, attained)
+  end
+  deltas = [] of Delta
+  text = plan.baseline_text
+  if text.is_a?(String)
+    deltas = compare(text, plan, outcome)
+    allowed = plan.max_regression
+    deltas.each do |d|
+      next unless d.metric.ends_with?("p50") || d.metric.ends_with?("p99") || d.metric == "requests_per_second"
+      if d.higher_better
+        results << GateResult.new("baseline", "baseline", d.metric, ">=", d.before * (1.0 - allowed / 100.0), d.after)
+      else
+        results << GateResult.new("baseline", "baseline", d.metric, "<=", d.before * (1.0 + allowed / 100.0), d.after)
+      end
+    end
+  end
+  breached = results.any? { |r| !r.passed }
+  if t.responses == 0 && t.faults > 0
+    Verdict.new(results, deltas, 3, "target_unreachable")
+  elsif breached
+    Verdict.new(results, deltas, 1, "gate_breached")
+  elsif outcome.signal == 2
+    Verdict.new(results, deltas, 130, "interrupted")
+  elsif outcome.signal == 15
+    Verdict.new(results, deltas, 143, "terminated")
+  else
+    Verdict.new(results, deltas, 0, "passed")
+  end
+end
