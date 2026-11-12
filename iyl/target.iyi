@@ -1,0 +1,153 @@
+module iyl/target
+
+import iyl/fault::{ConfigError}
+import std/text
+
+# One URL under load, read once at startup and never written after, so every
+# worker thread may hold it (SPEC.md III.4.4).
+pub class Target
+  # The URL as it was written, for the report.
+  getter url : String
+  # The method this URL is sent with, when a URL file named one.
+  getter method : String | Nil
+  getter scheme : String
+  # The host without the brackets an IPv6 literal is written in.
+  getter host : String
+  getter port : Int32
+  # The request target: path and query, always starting with `/`.
+  getter path : String
+  # `user:password` written in the URL, sent as Basic credentials.
+  getter userinfo : String | Nil
+
+  def initialize(@url : String, @method : String | Nil, @scheme : String, @host : String, @port : Int32, @path : String, @userinfo : String | Nil)
+  end
+
+  def tls? : Bool
+    @scheme == "https"
+  end
+
+  def default_port? : Bool
+    (@scheme == "https" && @port == 443) || (@scheme == "http" && @port == 80)
+  end
+
+  # The host as the `Host` header and an absolute URL write it.
+  def authority : String
+    name = @host.includes?(":") ? "[#{@host}]" : @host
+    default_port? ? name : "#{name}:#{@port}"
+  end
+
+  # What a kept connection is filed under.
+  def origin : String
+    "#{@scheme}://#{authority}"
+  end
+
+  # The same URL with *segment* added to its path, before any query.
+  def with_segment(segment : String) : String
+    query_at = @path.index('?')
+    if query_at.is_a?(Int32)
+      base = @path[0, query_at]
+      query = @path[query_at, @path.bytesize - query_at]
+    else
+      base = @path
+      query = ""
+    end
+    base = base.rstrip('/')
+    "#{base}/#{segment}#{query}"
+  end
+end
+
+# A URL to load: `http://` or `https://`, a host (a name, an IPv4 address or
+# an IPv6 one in brackets), an optional port, path and query. A URL written
+# without a scheme is `http://`. A fragment is never sent and is dropped.
+pub def parse_target(text : String, method : String | Nil = nil) : Target | ConfigError
+  raw = text.strip
+  return ConfigError.new("a URL is empty") if raw.empty?
+  rest = raw
+  scheme = "http"
+  lower = raw.downcase
+  if lower.starts_with?("http://")
+    rest = raw[7, raw.bytesize - 7]
+  elsif lower.starts_with?("https://")
+    scheme = "https"
+    rest = raw[8, raw.bytesize - 8]
+  elsif lower.includes?("://")
+    return ConfigError.new("'#{raw}' is not an http:// or https:// URL")
+  end
+  cut = rest.bytesize
+  i = 0
+  while i < rest.bytesize
+    c = rest[i]
+    if c == '/' || c == '?' || c == '#'
+      cut = i
+      break
+    end
+    i += 1
+  end
+  authority = rest[0, cut]
+  path = rest[cut, rest.bytesize - cut]
+  hash_at = path.index('#')
+  path = path[0, hash_at] if hash_at.is_a?(Int32)
+  path = "/" + path if path.starts_with?("?")
+  path = "/" if path.empty?
+  i = 0
+  while i < path.bytesize
+    c = path[i]
+    return ConfigError.new("'#{raw}' has a space or a control character in its path; percent-encode it") if c.ord <= 32 || c.ord == 127
+    i += 1
+  end
+  userinfo = nil
+  at = authority.rindex('@')
+  if at.is_a?(Int32)
+    userinfo = authority[0, at]
+    authority = authority[at + 1, authority.bytesize - at - 1]
+  end
+  return ConfigError.new("'#{raw}' names no host") if authority.empty?
+  host = authority
+  port_text = ""
+  if authority.starts_with?("[")
+    close = authority.index(']')
+    return ConfigError.new("'#{raw}' opens an IPv6 address with [ and never closes it") unless close.is_a?(Int32)
+    host = authority[1, close - 1]
+    after = authority[close + 1, authority.bytesize - close - 1]
+    if !after.empty?
+      return ConfigError.new("'#{raw}' has something other than a port after its IPv6 address") unless after.starts_with?(":")
+      port_text = after[1, after.bytesize - 1]
+    end
+  else
+    colon = authority.rindex(':')
+    if colon.is_a?(Int32)
+      host = authority[0, colon]
+      port_text = authority[colon + 1, authority.bytesize - colon - 1]
+    end
+  end
+  return ConfigError.new("'#{raw}' names no host") if host.empty?
+  port = scheme == "https" ? 443 : 80
+  unless port_text.empty?
+    number = port_text.to_i?
+    return ConfigError.new("'#{raw}' has a port that is not a number from 1 to 65535") unless number.is_a?(Int32) && number >= 1 && number <= 65535
+    port = number
+  end
+  Target.new(raw, method, scheme, host.downcase, port, path, userinfo)
+end
+
+# Where a redirect's `Location` points, read against the URL it came from:
+# absolute, scheme-relative (`//host/path`), absolute-path (`/path`), a query
+# (`?q`) or a path relative to the current one.
+pub def resolve_location(base : Target, location : String) : Target | ConfigError
+  loc = location.strip
+  lower = loc.downcase
+  return parse_target(loc) if lower.starts_with?("http://") || lower.starts_with?("https://")
+  return parse_target("#{base.scheme}:#{loc}") if loc.starts_with?("//")
+  path = if loc.starts_with?("/")
+           loc
+         elsif loc.starts_with?("?")
+           query_at = base.path.index('?')
+           (query_at.is_a?(Int32) ? base.path[0, query_at] : base.path) + loc
+         else
+           query_at = base.path.index('?')
+           dir = query_at.is_a?(Int32) ? base.path[0, query_at] : base.path
+           slash = dir.rindex('/')
+           (slash.is_a?(Int32) ? dir[0, slash + 1] : "/") + loc
+         end
+  parse_target("#{base.origin}#{path}")
+end

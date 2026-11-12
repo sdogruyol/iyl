@@ -1,0 +1,69 @@
+module test/target_test
+
+import iyl/target::{Target, parse_target, resolve_location}
+import iyl/fault::{ConfigError}
+
+test "scheme, host, port and path are read apart" do
+  t = parse_target("https://Example.com:8443/api/v1?x=1#frag").or_panic
+  assert_eq "https", t.scheme
+  assert_eq "example.com", t.host
+  assert_eq 8443, t.port
+  assert_eq "/api/v1?x=1", t.path
+  assert_eq "example.com:8443", t.authority
+  assert t.tls?
+end
+
+test "default ports are implied and not written in Host" do
+  t = parse_target("http://localhost").or_panic
+  assert_eq 80, t.port
+  assert_eq "/", t.path
+  assert_eq "localhost", t.authority
+  assert_eq 443, parse_target("https://a.test/").or_panic.port
+end
+
+test "a URL without a scheme is http" do
+  t = parse_target("127.0.0.1:3000/health").or_panic
+  assert_eq "http", t.scheme
+  assert_eq 3000, t.port
+  assert_eq "/health", t.path
+end
+
+test "IPv6 literals keep their brackets in the authority only" do
+  t = parse_target("http://[::1]:8080/").or_panic
+  assert_eq "::1", t.host
+  assert_eq "[::1]:8080", t.authority
+end
+
+test "credentials in the URL are kept apart from the host" do
+  t = parse_target("http://user:pa:ss@h.test/").or_panic
+  assert_eq "h.test", t.host
+  assert_eq "user:pa:ss", t.userinfo
+end
+
+test "a query alone becomes a path" do
+  assert_eq "/?a=1", parse_target("http://h.test?a=1").or_panic.path
+end
+
+test "bad URLs are refused" do
+  assert_error(ConfigError) { parse_target("ftp://h.test/") }
+  assert_error(ConfigError) { parse_target("http://:80/") }
+  assert_error(ConfigError) { parse_target("http://h.test:0/") }
+  assert_error(ConfigError) { parse_target("http://h.test:99999/") }
+  assert_error(ConfigError) { parse_target("http://h.test/a b") }
+  assert_error(ConfigError) { parse_target("http://[::1/") }
+end
+
+test "a segment goes before the query" do
+  t = parse_target("http://h.test/a/?q=1").or_panic
+  assert_eq "/a/abc?q=1", t.with_segment("abc")
+  assert_eq "/abc", parse_target("http://h.test").or_panic.with_segment("abc")
+end
+
+test "redirect locations resolve against the URL they came from" do
+  base = parse_target("http://h.test:81/a/b?x=1").or_panic
+  assert_eq "http://h.test:81/c", resolve_location(base, "/c").or_panic.url
+  assert_eq "http://h.test:81/a/d", resolve_location(base, "d").or_panic.url
+  assert_eq "http://h.test:81/a/b?y=2", resolve_location(base, "?y=2").or_panic.url
+  assert_eq "https://o.test/z", resolve_location(base, "https://o.test/z").or_panic.url
+  assert_eq "http://o.test/z", resolve_location(base, "//o.test/z").or_panic.url
+end
