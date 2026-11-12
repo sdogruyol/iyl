@@ -1,0 +1,16 @@
+module iyl/fault
+
+# A command line, file or setting that cannot run. The program exits 2 with
+# its sentence, before a single request is sent.
+pub struct ConfigError
+  getter text : String
+
+  def initialize(@text : String)
+  end
+end
+
+impl Error for ConfigError
+  def message : String
+    @text
+  end
+end

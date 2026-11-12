@@ -1,0 +1,38 @@
+module test/duration_test
+
+import iyl/duration::{parse_duration, format_duration}
+import iyl/fault::{ConfigError}
+
+S = 1_000_000_000_i64
+
+test "a bare number is seconds, and may be fractional" do
+  assert_eq 30_i64 * S, parse_duration("30", "-d").or_panic
+  assert_eq 1_500_000_000_i64, parse_duration("1.5", "-d").or_panic
+end
+
+test "units add up in any combination" do
+  assert_eq 5_400_i64 * S, parse_duration("1h30m", "-d").or_panic
+  assert_eq 500_000_000_i64, parse_duration("500ms", "-d").or_panic
+  assert_eq 250_000_i64, parse_duration("250us", "-d").or_panic
+  assert_eq 90_i64 * S, parse_duration("1m30s", "-d").or_panic
+  assert_eq 1_250_000_000_i64, parse_duration("1s250ms", "-d").or_panic
+end
+
+test "a value that is not a duration names the flag" do
+  error = assert_error(ConfigError) { parse_duration("10x", "--warmup") }
+  assert_includes error.message, "--warmup"
+  assert_error(ConfigError) { parse_duration("", "-d") }
+  assert_error(ConfigError) { parse_duration("s", "-d") }
+  assert_error(ConfigError) { parse_duration("-5", "-d") }
+  assert_error(ConfigError) { parse_duration("2y", "-d") }
+end
+
+test "formatting reads back as the same span" do
+  assert_eq "1h30m", format_duration(5_400_i64 * S)
+  assert_eq "45s", format_duration(45_i64 * S)
+  assert_eq "1.5s", format_duration(1_500_000_000_i64)
+  assert_eq "250ms", format_duration(250_000_000_i64)
+  assert_eq "1.25ms", format_duration(1_250_000_i64)
+  assert_eq "80us", format_duration(80_000_i64)
+  assert_eq "0s", format_duration(0_i64)
+end

@@ -1,0 +1,88 @@
+module iyl/duration
+
+import iyl/fault::{ConfigError}
+import std/text
+import std/format::{sprintf}
+
+# Nanoseconds in one of each unit a duration may be written in.
+pub def unit_ns(unit : String) : Int64 | Nil
+  case unit
+  when "ns"       then 1_i64
+  when "us", "µs" then 1_000_i64
+  when "ms"       then 1_000_000_i64
+  when "s"        then 1_000_000_000_i64
+  when "m"        then 60_000_000_000_i64
+  when "h"        then 3_600_000_000_000_i64
+  else                 nil
+  end
+end
+
+# A span of time as a person writes it on a command line: `30` (seconds),
+# `30s`, `1.5s`, `500ms`, `2m`, `1h30m`, `250us`. Units may repeat in any
+# order and add up; a bare number is seconds. *flag* names the option in the
+# sentence a bad value is refused with.
+pub def parse_duration(text : String, flag : String) : Int64 | ConfigError
+  s = text.strip
+  return ConfigError.new("#{flag} needs a duration such as 30s, 2m or 500ms") if s.empty?
+  if bare = s.to_f?
+    return refuse(text, flag) if bare < 0.0
+    return to_ns(bare * 1_000_000_000.0, text, flag)
+  end
+  total = 0.0
+  i = 0
+  n = s.bytesize
+  while i < n
+    start = i
+    while i < n && (s[i].ascii_number? || s[i] == '.')
+      i += 1
+    end
+    return refuse(text, flag) if i == start
+    number = s[start, i - start].to_f?
+    return refuse(text, flag) unless number.is_a?(Float64)
+    unit_start = i
+    while i < n && !s[i].ascii_number? && s[i] != '.'
+      i += 1
+    end
+    unit = unit_ns(s[unit_start, i - unit_start])
+    return refuse(text, flag) unless unit.is_a?(Int64)
+    total += number * unit.to_f
+  end
+  to_ns(total, text, flag)
+end
+
+private def to_ns(value : Float64, text : String, flag : String) : Int64 | ConfigError
+  # A year is far past any benchmark, and keeps the arithmetic far from the
+  # edge of an Int64 of nanoseconds.
+  return ConfigError.new("#{flag} #{text} is longer than a year") if value > 31_536_000_000_000_000.0
+  value.round.to_i64
+end
+
+private def refuse(text : String, flag : String) : ConfigError
+  ConfigError.new("#{flag} cannot read '#{text}' as a duration: write it as 30, 30s, 1.5s, 500ms, 2m or 1h30m")
+end
+
+# A duration as short as it can be written and read back: `1h30m`, `45s`,
+# `1.5s`, `250ms`, `80us`.
+pub def format_duration(ns : Int64) : String
+  return "0s" if ns <= 0
+  return "#{ns}ns" if ns < 1_000
+  return trim("%.3f", ns.to_f / 1_000.0) + "us" if ns < 1_000_000
+  return trim("%.3f", ns.to_f / 1_000_000.0) + "ms" if ns < 1_000_000_000
+  hours = ns // 3_600_000_000_000_i64
+  rest = ns % 3_600_000_000_000_i64
+  minutes = rest // 60_000_000_000_i64
+  rest = rest % 60_000_000_000_i64
+  text = ""
+  text += "#{hours}h" if hours > 0
+  text += "#{minutes}m" if minutes > 0
+  text += trim("%.3f", rest.to_f / 1_000_000_000.0) + "s" if rest > 0
+  text
+end
+
+# A number with at most three decimals, its trailing zeros dropped.
+private def trim(pattern : String, value : Float64) : String
+  text = sprintf(pattern, value)
+  return text unless text.includes?(".")
+  text = text.rstrip('0')
+  text.ends_with?(".") ? text[0, text.bytesize - 1] : text
+end
