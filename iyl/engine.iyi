@@ -1,0 +1,444 @@
+module iyl/engine
+
+import std/list::{List}
+import std/random::{Random}
+import std/tls::{TlsConfig, TlsVersion}
+import std/x509::{Certificate, X509Error}
+import std/signal::{Signal}
+import std/format::{sprintf}
+import std/text
+import iyl/plan::{Plan, Prepared, request_target, request_tail}
+import iyl/target::{Target, resolve_location}
+import iyl/fault::{ConfigError}
+import iyl/tally::{Tally}
+import iyl/wire::{Conn, Answer, Fault, Limits, DnsCache, open, exchange, now_ns}
+
+# How long requests still in flight when a timed run ends may take to finish
+# before they are abandoned.
+GRACE_NS = 1_000_000_000_i64
+
+# What every worker thread shares: the clock the run is measured on, the
+# schedule `--rate` hands slots out of, the counters the progress line reads,
+# and the word that tells every connection to stop. Each field is assigned
+# once, so this is `Share` (SPEC.md III.4.4); what changes is inside atomics.
+pub class Live
+  # When measuring starts, after any warmup.
+  getter start_ns : Int64
+  # When a timed run stops sending; 0 for a run bounded by requests alone.
+  getter deadline_ns : Int64
+  # The gap between scheduled requests; 0 when unpaced.
+  getter interval_ns : Int64
+  getter done = Atomic(Int64).new(0_i64)
+  getter failures = Atomic(Int64).new(0_i64)
+  getter claimed = Atomic(Int64).new(0_i64)
+  getter cursor = Atomic(Int64).new(0_i64)
+  getter next_slot = Atomic(Int64).new(0_i64)
+  getter stop = Atomic(Int32).new(0)
+
+  def initialize(@start_ns : Int64, @deadline_ns : Int64, @interval_ns : Int64)
+  end
+
+  def stopped? : Bool
+    @stop.get != 0
+  end
+end
+
+# How a run ended, and what it measured.
+pub class Outcome
+  getter tally : Tally
+  getter start_ns : Int64
+  getter end_ns : Int64
+  # The signal that cut the run short: 2 for SIGINT, 15 for SIGTERM, 0 for none.
+  getter signal : Int32
+  # Slots the schedule should have issued over the run, and those it did;
+  # both 0 without `--rate`.
+  getter scheduled : Int64
+  getter issued : Int64
+  getter workers : Int32
+
+  def initialize(@tally : Tally, @start_ns : Int64, @end_ns : Int64, @signal : Int32, @scheduled : Int64, @issued : Int64, @workers : Int32)
+  end
+
+  def elapsed_s : Float64
+    (@end_ns - @start_ns).to_f / 1_000_000_000.0
+  end
+
+  def skipped : Int64
+    @scheduled > @issued ? @scheduled - @issued : 0_i64
+  end
+end
+
+# The main thread's view of a run in progress, shared by its own tasks only.
+class Control
+  property workers : IyiGroup | Nil = nil
+  property signal : Int32 = 0
+  property finished : Bool = false
+  property cut : Bool = false
+
+  def initialize
+  end
+end
+
+# A TLS configuration for one worker, for its `https://` targets and any a
+# redirect leads to: the roots `--cacert` names, or the system's; TLS 1.3,
+# and 1.2 for a server that speaks no newer; ALPN offering HTTP/1.1, the
+# protocol spoken.
+def tls_for(plan : Plan) : TlsConfig
+  config = TlsConfig.new
+  config.alpn = ["http/1.1"]
+  config.min_version = TlsVersion::TLS12
+  pem = plan.cacert
+  if pem.is_a?(String)
+    roots = Certificate.from_pem(pem)
+    config.roots = roots if roots.is_a?(Array(Certificate))
+  end
+  config
+end
+
+# One connection's worth of load: a virtual user that sends a request,
+# reads the whole answer and sends the next, keeping one connection per
+# origin it has spoken to.
+class Agent
+  @plan : Plan
+  @live : Live
+  @tally : Tally
+  @dns : DnsCache
+  @tls : TlsConfig
+  @pool : Hash(String, Conn)
+  @random : Random
+
+  def initialize(@plan : Plan, @live : Live, @tally : Tally, @dns : DnsCache, @tls : TlsConfig, seed : UInt64)
+    @pool = {} of String => Conn
+    @random = Random.new(seed)
+  end
+
+  def close_all : Nil
+    @pool.each_value(&.close)
+    @pool.clear
+  end
+
+  # Sends requests until *until_ns* (0: no bound in time), the request
+  # count runs out, or the run is stopped. Without *measure* it is warmup:
+  # unpaced, unrecorded, its connections kept for what follows.
+  def drive(measure : Bool, until_ns : Int64) : Nil
+    while true
+      return if @live.stopped?
+      scheduled = 0_i64
+      if measure && @plan.requests > 0
+        return if @live.claimed.add(1_i64) >= @plan.requests
+      end
+      if measure && @live.interval_ns > 0
+        offset = @live.next_slot.add(@live.interval_ns)
+        scheduled = @live.start_ns + offset
+        return if until_ns > 0 && scheduled >= until_ns
+        return unless wait_until(scheduled)
+        @tally.slot
+      else
+        return if until_ns > 0 && now_ns >= until_ns
+      end
+      count = @plan.targets.size
+      prepared = @plan.targets[(@live.cursor.add(1_i64) % count.to_i64).to_i32]
+      return unless perform(prepared, scheduled, measure)
+    end
+  end
+
+  # Parks until *at*, a slot of the schedule; false when the run was
+  # stopped or cancelled first. Never early: a slot is not sent before it is
+  # due, so a send delay is never negative.
+  def wait_until(at : Int64) : Bool
+    while true
+      return false if @live.stopped?
+      left = at - now_ns
+      return true if left <= 0
+      ms = left // 1_000_000_i64
+      ms = 100_i64 if ms > 100
+      return false if sleep(ms.to_i32).is_a?(Cancelled)
+    end
+  end
+
+  def pool_key(target : Target) : String
+    proxy = @plan.proxy
+    proxy.is_a?(Target) && !target.tls? ? "proxy " + proxy.origin : target.origin
+  end
+
+  def connection(target : Target, measure : Bool) : Conn | Fault | Cancelled
+    key = pool_key(target)
+    kept = @pool[key]?
+    return kept if kept.is_a?(Conn) && kept.open?
+    made = open(target, @plan.proxy, @plan.proxy_auth, @tls, @dns, @plan.timeout_ms)
+    return made unless made.is_a?(Conn)
+    setup = made.take_setup
+    @tally.setup(setup.dns_ns, setup.connect_ns, setup.tls_ns) if measure && setup
+    @pool[key] = made
+    made
+  end
+
+  def drop(target : Target) : Nil
+    key = pool_key(target)
+    conn = @pool[key]?
+    if conn.is_a?(Conn)
+      conn.close
+      @pool.delete(key)
+    end
+  end
+
+  # The request's bytes for a redirect hop: the run's headers, less the
+  # credentials when the hop leaves the origin they were written for.
+  def hop_request(target : Target, method : String, body : String, same_origin : Bool) : String
+    headers = @plan.headers
+    unless same_origin
+      kept = headers.select { |h| h[0].downcase != "authorization" && h[0].downcase != "cookie" }
+      headers = List.new(kept)
+    end
+    "#{method} #{request_target(target, target.path, @plan.proxy)}" + request_tail(target, method, body, headers, @plan.proxy, @plan.proxy_auth, nil)
+  end
+
+  # One request, redirects followed as part of it. False when the run was
+  # cancelled under it, so the caller stops.
+  def perform(prepared : Prepared, scheduled_at : Int64, measure : Bool) : Bool
+    start = now_ns
+    scheduled = scheduled_at > 0 ? scheduled_at : start
+    target = prepared.target
+    origin = target.origin
+    method = prepared.method
+    head_request = prepared.head_request
+    request = prepared.request
+    if @plan.random_path
+      path = target.with_segment(@random.hex(4))
+      request = "#{method} #{request_target(target, path, @plan.proxy)}#{prepared.tail}"
+    end
+    deadline = @plan.request_timeout_ns > 0 ? start + @plan.request_timeout_ns : 0_i64
+    limits = Limits.new(@plan.timeout_ms, deadline)
+    hops = 0
+    retried = false
+    while true
+      conn = connection(target, measure)
+      if conn.is_a?(Cancelled)
+        @tally.abandon if measure
+        return false
+      end
+      if conn.is_a?(Fault)
+        record_fault(prepared, start, conn, measure)
+        return true
+      end
+      answer = exchange(conn, request, head_request, @plan.follow_redirects, limits)
+      if answer.is_a?(Cancelled)
+        drop(target)
+        @tally.abandon if measure
+        return false
+      end
+      if answer.is_a?(Fault)
+        drop(target)
+        # A kept connection the server closed while it was idle: sent again
+        # once on a new one, when sending twice is safe (RFC 9110 9.2.2).
+        if answer.stale && !retried && idempotent?(method)
+          retried = true
+          next
+        end
+        record_fault(prepared, start, answer, measure)
+        return true
+      end
+      drop(target) unless answer.keep_alive && @plan.keepalive
+      location = answer.location
+      status = answer.status
+      if @plan.follow_redirects && status >= 300 && status < 400 && location.is_a?(String) && hops < @plan.max_redirects
+        following = resolve_location(target, location)
+        if following.is_a?(Target)
+          hops += 1
+          @tally.redirect if measure
+          keep_method = status == 307 || status == 308
+          if !keep_method && (status == 303 || method == "POST") && method != "HEAD"
+            method = "GET"
+          end
+          body = keep_method ? @plan.body : ""
+          body = "" if method == "GET" || method == "HEAD"
+          target = following
+          head_request = method == "HEAD"
+          request = hop_request(target, method, body, target.origin == origin)
+          retried = false
+          next
+        end
+      end
+      if measure
+        finish = now_ns
+        @tally.response(prepared.index, scheduled, start, answer.first_byte_ns, finish, status, @plan.success?(status), answer.body_bytes)
+        @live.done.add(1_i64)
+        @live.failures.add(1_i64) unless @plan.success?(status)
+      end
+      return true
+    end
+  end
+
+  def record_fault(prepared : Prepared, start : Int64, fault : Fault, measure : Bool) : Nil
+    return unless measure
+    @tally.fault(prepared.index, start, now_ns, fault.category, fault.detail)
+    @live.done.add(1_i64)
+    @live.failures.add(1_i64)
+  end
+end
+
+# Whether sending a request with *method* twice means what sending it once
+# does (RFC 9110 section 9.2.2).
+def idempotent?(method : String) : Bool
+  method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"
+end
+
+# The connections each worker drives: as even as the counts allow.
+def share_of(total : Int32, workers : Int32, index : Int32) : Int32
+  base = total // workers
+  index < total % workers ? base + 1 : base
+end
+
+# One worker thread's part of the run: its connections, each a task on the
+# worker, and the tally they all write.
+def work(plan : Plan, live : Live, index : Int32) : Tally
+  urls = plan.targets.size
+  tally = Tally.new(urls > 1 && urls <= 1000 ? urls : 0)
+  tls = tls_for(plan)
+  dns = DnsCache.new
+  mine = share_of(plan.connections, plan.workers, index)
+  seed = Random.new.next_u.to_u64
+  group do |g|
+    mine.times do |k|
+      g.spawn do
+        agent = Agent.new(plan, live, tally, dns, tls, seed &+ k.to_u64)
+        agent.drive(false, live.start_ns) if plan.warmup_ns > 0
+        agent.drive(true, live.deadline_ns)
+        agent.close_all
+        0
+      end
+    end
+  end
+  tally
+end
+
+def thousands(n : Int64) : String
+  text = n.abs.to_s
+  out = ""
+  i = 0
+  while i < text.bytesize
+    out += "," if i > 0 && (text.bytesize - i) % 3 == 0
+    out += text[i].to_s
+    i += 1
+  end
+  n < 0 ? "-" + out : out
+end
+
+def progress_line(live : Live, now : Int64, plan : Plan) : String
+  if now < live.start_ns
+    return sprintf("\r  warming up  %.1fs left\e[K", (live.start_ns - now).to_f / 1_000_000_000.0)
+  end
+  elapsed = (now - live.start_ns).to_f / 1_000_000_000.0
+  done = live.done.get
+  failures = live.failures.get
+  rate = elapsed > 0.0 ? done.to_f / elapsed : 0.0
+  share = done > 0 ? failures.to_f * 100.0 / done.to_f : 0.0
+  goal = ""
+  if live.deadline_ns > 0
+    goal = sprintf(" / %.0fs", (live.deadline_ns - live.start_ns).to_f / 1_000_000_000.0)
+  elsif plan.requests > 0
+    goal = sprintf(" (%.0f%%)", done.to_f * 100.0 / plan.requests.to_f)
+  end
+  sprintf("\r  %.1fs%s  %s requests  %s req/s  %.2f%% failed\e[K", elapsed, goal, thousands(done), thousands(rate.round.to_i64), share)
+end
+
+# Runs the plan: warmup, then the measured load on every worker, a live line
+# on stderr when asked for, and SIGINT (and SIGTERM, where there is one)
+# ending it early with what was measured so far.
+pub def run(plan : Plan) : Outcome
+  interval = plan.rate > 0.0 ? (1_000_000_000.0 / plan.rate).round.to_i64 : 0_i64
+  interval = 1_i64 if plan.rate > 0.0 && interval < 1
+  begin_ns = now_ns
+  start = begin_ns + plan.warmup_ns
+  deadline = plan.duration_ns > 0 ? start + plan.duration_ns : 0_i64
+  live = Live.new(start, deadline, interval)
+  ctl = Control.new
+  tallies = [] of Tally
+  group do |g|
+    g.spawn do
+      group do |wg|
+        ctl.workers = wg
+        handles = [] of IyiTask(Tally)
+        plan.workers.times do |index|
+          handles << wg.spawn_parallel { work(plan, live, index) }
+        end
+        handles.each do |handle|
+          got = handle.value
+          if got.is_a?(Tally)
+            tallies << got
+          else
+            # A bug, not the target's doing: said, and the other workers'
+            # measurements still reported.
+            STDERR.puts "iyl: a worker stopped: #{got.message}"
+          end
+        end
+      end
+      ctl.finished = true
+      g.cancel_children
+      0
+    end
+    g.spawn do
+      shown = 0_i64
+      until ctl.finished
+        break if sleep(100).is_a?(Cancelled)
+        now = now_ns
+        if deadline > 0 && now > deadline + GRACE_NS && !ctl.cut
+          ctl.cut = true
+          live.stop.set(1)
+          wg = ctl.workers
+          wg.cancel_children if wg.is_a?(IyiGroup)
+        end
+        if plan.progress && now - shown >= 500_000_000_i64
+          shown = now
+          STDERR.print(progress_line(live, now, plan))
+          STDERR.flush
+        end
+      end
+      0
+    end
+    g.spawn do
+      {% if flag?(:win32) %}
+        Signal.each(Signal::INT) do |sig|
+          exit 130 if ctl.signal != 0
+          ctl.signal = sig.value
+          live.stop.set(1)
+          wg = ctl.workers
+          wg.cancel_children if wg.is_a?(IyiGroup)
+        end
+      {% else %}
+        Signal.each(Signal::INT, Signal::TERM) do |sig|
+          exit(sig.value == 15 ? 143 : 130) if ctl.signal != 0
+          ctl.signal = sig.value
+          live.stop.set(1)
+          wg = ctl.workers
+          wg.cancel_children if wg.is_a?(IyiGroup)
+        end
+      {% end %}
+      0
+    end
+  end
+  if plan.progress
+    STDERR.print("\r\e[K")
+    STDERR.flush
+  end
+  total = Tally.new(tallies.empty? ? 0 : tallies[0].urls.size)
+  tallies.each { |t| total.merge(t) }
+  # The measured window: until the last answer, or the deadline when the
+  # run kept to it, or the moment a signal stopped it.
+  ended = now_ns
+  finish = total.last_ns > 0 ? total.last_ns : ended
+  if ctl.signal != 0
+    finish = ended
+  elsif deadline > 0 && finish < deadline && ended >= deadline
+    finish = deadline
+  end
+  finish = start + 1 if finish <= start
+  # The slots that fell due inside the window, at most the request count.
+  scheduled = 0_i64
+  if interval > 0
+    window = (deadline > 0 && finish > deadline ? deadline : finish) - start
+    scheduled = (window + interval - 1) // interval
+    scheduled = plan.requests if plan.requests > 0 && scheduled > plan.requests
+  end
+  Outcome.new(total, start, finish, ctl.signal, scheduled, total.slots, plan.workers)
+end
